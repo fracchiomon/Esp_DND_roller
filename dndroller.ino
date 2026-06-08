@@ -21,6 +21,14 @@ using namespace fs;
 #define CALIBRATION_FILE "/TouchCalData1"
 #define REPEAT_CAL false
 
+// ── ANIMATION TIMING CONFIGURATION ──────────────────────────────────────────
+// Time (in ms) to play the fast rolling animation
+const unsigned long ROLLING_ANIMATION_DURATION = 2000UL;  // 2 seconds
+// Total time (in ms) to play the entire animation (fast + slowdown)
+const unsigned long TOTAL_ANIMATION_DURATION = 3000UL;    // 3 seconds
+// Frame rate for animation (in ms between frames)
+const unsigned long ANIMATION_FRAME_MS = 50UL;            // 20 FPS
+
 TFT_eSPI tft = TFT_eSPI();
 ButtonWidget* diceButtons[7];  // Increased to 7 for D100
 ButtonWidget* quantityUpBtn;
@@ -641,7 +649,7 @@ void animateDice() {
   if (selectedDiceIndex == -1) return;
   
   // Animation timing
-  if (millis() - lastAnimationTime < 50) return;  // 20 FPS
+  if (millis() - lastAnimationTime < ANIMATION_FRAME_MS) return;
   lastAnimationTime = millis();
   
   // Clear animation area
@@ -659,7 +667,7 @@ void animateDice() {
     angleZ += 0.2;
   } else if (animationActive) {
     // Slow down after roll
-    float slowdownFactor = 1.0 - ((millis() - animationStartTime - 2000) / 1000.0);
+    float slowdownFactor = 1.0 - ((millis() - animationStartTime - ROLLING_ANIMATION_DURATION) / 1000.0);
     if (slowdownFactor < 0.1) slowdownFactor = 0.1;
     angleX += 0.3 * slowdownFactor;
     angleY += 0.25 * slowdownFactor;
@@ -1008,12 +1016,12 @@ void loop() {
     animateDice();
     
     // Check if rolling animation should transition to slowdown
-    if (isRolling && (millis() - animationStartTime > 2000)) {
-      isRolling = false;  // Stop fast spin after 2 seconds
+    if (isRolling && (millis() - animationStartTime > ROLLING_ANIMATION_DURATION)) {
+      isRolling = false;  // Stop fast spin
     }
     
     // Check if animation should end and show results
-    if (!resultsShown && animationActive && (millis() - animationStartTime > 3000)) {
+    if (!resultsShown && animationActive && (millis() - animationStartTime > TOTAL_ANIMATION_DURATION)) {
       animationActive = false;
       resultsShown = true;
       displayResults();
