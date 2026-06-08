@@ -9,25 +9,10 @@ using namespace fs;
 #include <stdint.h>
 // Use ESP32 hardware RNG for unbiased dice rolls
 #include "esp_system.h"
-#include "esp_sleep.h"
-
-// ── RGB LED (active-LOW on CYD) ──────────────────────────────────────────────
-#define LED_RED_PIN    4
-#define LED_GREEN_PIN  16
-#define LED_BLUE_PIN   17
-#define LED_DUTY_OFF   255   // active-LOW: 255 = off
-#define LED_DUTY_ON    204   // 80% duty = ~20% brightness
+//#include "esp_random.h"
 
 #define CALIBRATION_FILE "/TouchCalData1"
 #define REPEAT_CAL false
-
-// ── ANIMATION TIMING CONFIGURATION ──────────────────────────────────────────
-// Time (in ms) to play the fast rolling animation
-const unsigned long ROLLING_ANIMATION_DURATION = 2000UL;  // 2 seconds
-// Total time (in ms) to play the entire animation (fast + slowdown)
-const unsigned long TOTAL_ANIMATION_DURATION = 3000UL;    // 3 seconds
-// Frame rate for animation (in ms between frames)
-const unsigned long ANIMATION_FRAME_MS = 50UL;            // 20 FPS
 
 TFT_eSPI tft = TFT_eSPI();
 ButtonWidget* diceButtons[7];  // Increased to 7 for D100
@@ -44,6 +29,26 @@ int selectedDiceIndex = -1;  // Track which dice is selected
 int diceQuantity = 1;        // Number of dice to roll (1-10)
 int rollResults[10];         // Store individual dice results
 int totalResult = 0;         // Sum of all dice
+
+enum RollMode {
+  MODE_NORMAL = 0,
+  MODE_ADVANTAGE = 1,
+  MODE_DISADVANTAGE = 2
+};
+
+RollMode currentRollMode = MODE_NORMAL;
+
+static inline uint16_t getRollModeColor(RollMode mode) {
+  if (mode == MODE_ADVANTAGE) return TFT_GREEN;
+  if (mode == MODE_DISADVANTAGE) return TFT_RED;
+  return TFT_YELLOW;
+}
+
+static inline const char* getRollModeLabel(RollMode mode) {
+  if (mode == MODE_ADVANTAGE) return "Adv";
+  if (mode == MODE_DISADVANTAGE) return "Dis";
+  return "Norm";
+}
 
 // Button position storage for redrawing
 struct ButtonPos {
@@ -337,9 +342,7 @@ float angleZ = 0;
 bool animationActive = false;
 bool isRolling = false;  // Track if we're in rolling animation
 unsigned long lastAnimationTime = 0;
-unsigned long animationStartTime  = 0;
-unsigned long lastActivityTime    = 0;
-const unsigned long SLEEP_TIMEOUT = 3UL * 60UL * 1000UL;
+unsigned long animationStartTime = 0;
 
 // Global orthographic scale so all dice share the same on-screen size
 const float ORTHO_SCALE = 40.0f;  // tuned to roughly match D20 apparent size
@@ -354,6 +357,25 @@ void displayResults() {
   
   tft.setTextSize(2);
   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+
+  if (selectedDiceIndex == 5 && currentRollMode != MODE_NORMAL) {
+    int r1 = rollResults[0];
+    int r2 = rollResults[1];
+    uint16_t accent = (currentRollMode == MODE_ADVANTAGE) ? TFT_GREEN : TFT_RED;
+
+    tft.setCursor(130, 8);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.print("D20 ");
+    tft.setTextColor(accent, TFT_BLACK);
+    tft.print(getRollModeLabel(currentRollMode));
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.print(": ");
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.printf("%d / %d  ->  ", r1, r2);
+    tft.setTextColor(accent, TFT_BLACK);
+    tft.printf("%d", totalResult);
+    return;
+  }
   
   // Display results at top right
   if (diceQuantity > 1) {
@@ -363,10 +385,8 @@ void displayResults() {
     for (int i = 0; i < diceQuantity && i < 6; i++) { // Fewer to fit with bigger text
       tft.printf("%d ", rollResults[i]);
     }
-    if (diceQuantity > 4 && diceQuantity < 7) tft.setTextSize(1);
-    if (diceQuantity > 6) {
-      tft.print("...");
-    }
+    if (diceQuantity > 6) tft.print("...");
+    
     // Show total on second line
     tft.setCursor(130, 24);
     tft.setTextSize(2);
@@ -649,7 +669,7 @@ void animateDice() {
   if (selectedDiceIndex == -1) return;
   
   // Animation timing
-  if (millis() - lastAnimationTime < ANIMATION_FRAME_MS) return;  // 20 FPS
+  if (millis() - lastAnimationTime < 50) return;  // 20 FPS
   lastAnimationTime = millis();
   
   // Clear animation area
@@ -791,6 +811,19 @@ void rollDice() {
   
   totalResult = 0;
   int sides = diceSides[selectedDiceIndex];
+
+  if (selectedDiceIndex == 5 && currentRollMode != MODE_NORMAL) {
+    int r1 = rollUnbiasedDie(sides);
+    int r2 = rollUnbiasedDie(sides);
+    rollResults[0] = r1;
+    rollResults[1] = r2;
+    if (currentRollMode == MODE_ADVANTAGE) {
+      totalResult = (r1 > r2) ? r1 : r2;
+    } else {
+      totalResult = (r1 < r2) ? r1 : r2;
+    }
+    return;
+  }
   
   // Roll multiple dice
   for (int i = 0; i < diceQuantity; i++) {
@@ -814,7 +847,10 @@ void updateQuantityDisplay() {
 void updateDiceSelection() {
   // Update all dice button colors to show selection
   for (int i = 0; i < buttonCount; i++) {
-    uint16_t fill = (i == selectedDiceIndex) ? TFT_GREEN : TFT_BLUE;
+    uint16_t fill = TFT_BLUE;
+    if (i == selectedDiceIndex) {
+      fill = (i == 5) ? getRollModeColor(currentRollMode) : TFT_GREEN;
+    }
     diceButtons[i]->initButtonUL(diceButtonPos[i].x, diceButtonPos[i].y, 
                                  diceButtonPos[i].w, diceButtonPos[i].h,
                                  TFT_WHITE, fill, TFT_WHITE, "", 2);
@@ -831,7 +867,14 @@ void btn1_action() { selectedDiceIndex = 1; updateDiceSelection(); }
 void btn2_action() { selectedDiceIndex = 2; updateDiceSelection(); }
 void btn3_action() { selectedDiceIndex = 3; updateDiceSelection(); }
 void btn4_action() { selectedDiceIndex = 4; updateDiceSelection(); }
-void btn5_action() { selectedDiceIndex = 5; updateDiceSelection(); }
+void btn5_action() {
+  if (selectedDiceIndex == 5) {
+    currentRollMode = (RollMode)((currentRollMode + 1) % 3);
+  } else {
+    selectedDiceIndex = 5;
+  }
+  updateDiceSelection();
+}
 void btn6_action() { selectedDiceIndex = 6; updateDiceSelection(); }
 
 void quantityUp_action() {
@@ -919,7 +962,7 @@ void touch_calibrate() {
   if (LittleFS.exists(CALIBRATION_FILE)) {
     if (!REPEAT_CAL) {
       File f = LittleFS.open(CALIBRATION_FILE, "r");
-      if (f && f.readBytes((char *)calData, sizeof(calData)) == sizeof(calData))
+      if (f && f.readBytes((char *)calData, 14) == 14)
         calDataOK = true;
       f.close();
     } else {
@@ -939,7 +982,7 @@ void touch_calibrate() {
     tft.calibrateTouch(calData, TFT_MAGENTA, TFT_BLACK, 15);
     File f = LittleFS.open(CALIBRATION_FILE, "w");
     if (f) {
-      f.write((const unsigned char *)calData, sizeof(calData));
+      f.write((const unsigned char *)calData, 14);
       f.close();
     }
     tft.setTouch(calData);
@@ -948,7 +991,7 @@ void touch_calibrate() {
 
 void setup() {
   Serial.begin(115200);
-  // esp_random() used for dice — randomSeed() not needed
+  randomSeed(analogRead(0));
   tft.begin();
   tft.setRotation(1);  // Landscape 90° right
   tft.fillScreen(TFT_BLACK);
@@ -997,16 +1040,6 @@ void setup() {
   buildIcosaFaces();
 
   touch_calibrate();
-
-  // LED: PWM cyan at 20% brightness
-  ledcAttach(LED_RED_PIN,   5000, 8);
-  ledcAttach(LED_GREEN_PIN, 5000, 8);
-  ledcAttach(LED_BLUE_PIN,  5000, 8);
-  ledcWrite(LED_RED_PIN,   LED_DUTY_OFF);
-  ledcWrite(LED_GREEN_PIN, LED_DUTY_ON);
-  ledcWrite(LED_BLUE_PIN,  LED_DUTY_ON);
-
-  lastActivityTime = millis();
   setupDiceButtons();
 }
 
@@ -1016,76 +1049,46 @@ void loop() {
     animateDice();
     
     // Check if rolling animation should transition to slowdown
-    if (isRolling && (millis() - animationStartTime > ROLLING_ANIMATION_DURATION)) {
+    if (isRolling && (millis() - animationStartTime > 2000)) {
       isRolling = false;  // Stop fast spin after 2 seconds
     }
     
     // Check if animation should end and show results
-    if (!resultsShown && animationActive && (millis() - animationStartTime > TOTAL_ANIMATION_DURATION)) {
+    if (!resultsShown && animationActive && (millis() - animationStartTime > 3000)) {
       animationActive = false;
       resultsShown = true;
       displayResults();
     }
   }
   
-  static uint32_t lastScan        = 0;
-  static uint32_t lastPressTime   = 0;
-  static bool     repeatTriggered = false;
-
-  if (millis() - lastScan >= ANIMATION_FRAME_MS) {
+  static uint32_t lastScan = 0;
+  if (millis() - lastScan >= 50) {
     uint16_t x, y;
     bool touched = tft.getTouch(&x, &y);
-
+    
+    // Check all buttons
     ButtonWidget* allButtons[] = {
       diceButtons[0], diceButtons[1], diceButtons[2], diceButtons[3],
       diceButtons[4], diceButtons[5], diceButtons[6],
       quantityUpBtn, quantityDownBtn, rollBtn
     };
     int totalButtons = 10;
-
+    
     if (touched) {
-      lastActivityTime = millis();
       for (int i = 0; i < totalButtons; i++) {
         if (allButtons[i]->contains(x, y)) {
-          if (!allButtons[i]->isPressed()) {
-            // First press: fire immediately
-            allButtons[i]->press(true);
-            allButtons[i]->pressAction();
-            lastPressTime   = millis();
-            repeatTriggered = false;
-          } else {
-            // Held: auto-repeat only for quantity buttons
-            if (allButtons[i] == quantityUpBtn || allButtons[i] == quantityDownBtn) {
-              uint32_t held = millis() - lastPressTime;
-              uint32_t threshold = repeatTriggered ? 200UL : 600UL;
-              if (held >= threshold) {
-                allButtons[i]->pressAction();
-                lastPressTime   = millis();
-                repeatTriggered = true;
-              }
-            }
-          }
+          allButtons[i]->press(true);
+          allButtons[i]->pressAction();
           break;
         }
       }
     } else {
-      for (int i = 0; i < totalButtons; i++) allButtons[i]->press(false);
-      repeatTriggered = false;
+      // Release all buttons
+      for (int i = 0; i < totalButtons; i++) {
+        allButtons[i]->press(false);
+      }
     }
-
-    // Auto-sleep after 3 minutes of inactivity
-    if (millis() - lastActivityTime > SLEEP_TIMEOUT) {
-      tft.fillScreen(TFT_BLACK);
-      tft.setTextDatum(MC_DATUM);
-      tft.setTextSize(2);
-      tft.setTextColor(TFT_WHITE, TFT_BLACK);
-      tft.drawString("Buona notte...", 160, 120);
-      delay(1000);
-      tft.fillScreen(TFT_BLACK);
-      esp_sleep_enable_ext0_wakeup(GPIO_NUM_36, 0);
-      esp_deep_sleep_start();
-    }
-
+    
     lastScan = millis();
   }
 }
