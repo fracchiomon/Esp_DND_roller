@@ -9,6 +9,14 @@ using namespace fs;
 #include <stdint.h>
 // Use ESP32 hardware RNG for unbiased dice rolls
 #include "esp_system.h"
+#include "esp_sleep.h"
+
+// ── RGB LED (active-LOW on CYD) ──────────────────────────────────────────────
+#define LED_RED_PIN    4
+#define LED_GREEN_PIN  16
+#define LED_BLUE_PIN   17
+#define LED_DUTY_OFF   255   // active-LOW: 255 = off
+#define LED_DUTY_ON    204   // 80% duty = ~20% brightness
 
 #define CALIBRATION_FILE "/TouchCalData1"
 #define REPEAT_CAL false
@@ -321,7 +329,9 @@ float angleZ = 0;
 bool animationActive = false;
 bool isRolling = false;  // Track if we're in rolling animation
 unsigned long lastAnimationTime = 0;
-unsigned long animationStartTime = 0;
+unsigned long animationStartTime  = 0;
+unsigned long lastActivityTime    = 0;
+const unsigned long SLEEP_TIMEOUT = 3UL * 60UL * 1000UL;
 
 // Global orthographic scale so all dice share the same on-screen size
 const float ORTHO_SCALE = 40.0f;  // tuned to roughly match D20 apparent size
@@ -345,8 +355,10 @@ void displayResults() {
     for (int i = 0; i < diceQuantity && i < 6; i++) { // Fewer to fit with bigger text
       tft.printf("%d ", rollResults[i]);
     }
-    if (diceQuantity > 6) tft.print("...");
-    
+    if (diceQuantity > 4 && diceQuantity < 7) tft.setTextSize(1);
+    if (diceQuantity > 6) {
+      tft.print("...");
+    }
     // Show total on second line
     tft.setCursor(130, 24);
     tft.setTextSize(2);
@@ -899,7 +911,7 @@ void touch_calibrate() {
   if (LittleFS.exists(CALIBRATION_FILE)) {
     if (!REPEAT_CAL) {
       File f = LittleFS.open(CALIBRATION_FILE, "r");
-      if (f && f.readBytes((char *)calData, 14) == 14)
+      if (f && f.readBytes((char *)calData, sizeof(calData)) == sizeof(calData))
         calDataOK = true;
       f.close();
     } else {
@@ -919,7 +931,7 @@ void touch_calibrate() {
     tft.calibrateTouch(calData, TFT_MAGENTA, TFT_BLACK, 15);
     File f = LittleFS.open(CALIBRATION_FILE, "w");
     if (f) {
-      f.write((const unsigned char *)calData, 14);
+      f.write((const unsigned char *)calData, sizeof(calData));
       f.close();
     }
     tft.setTouch(calData);
@@ -928,7 +940,7 @@ void touch_calibrate() {
 
 void setup() {
   Serial.begin(115200);
-  randomSeed(analogRead(0));
+  // esp_random() used for dice — randomSeed() not needed
   tft.begin();
   tft.setRotation(1);  // Landscape 90° right
   tft.fillScreen(TFT_BLACK);
@@ -977,6 +989,16 @@ void setup() {
   buildIcosaFaces();
 
   touch_calibrate();
+
+  // LED: PWM cyan at 20% brightness
+  ledcAttach(LED_RED_PIN,   5000, 8);
+  ledcAttach(LED_GREEN_PIN, 5000, 8);
+  ledcAttach(LED_BLUE_PIN,  5000, 8);
+  ledcWrite(LED_RED_PIN,   LED_DUTY_OFF);
+  ledcWrite(LED_GREEN_PIN, LED_DUTY_ON);
+  ledcWrite(LED_BLUE_PIN,  LED_DUTY_ON);
+
+  lastActivityTime = millis();
   setupDiceButtons();
 }
 
@@ -998,34 +1020,64 @@ void loop() {
     }
   }
   
-  static uint32_t lastScan = 0;
+  static uint32_t lastScan        = 0;
+  static uint32_t lastPressTime   = 0;
+  static bool     repeatTriggered = false;
+
   if (millis() - lastScan >= 50) {
     uint16_t x, y;
     bool touched = tft.getTouch(&x, &y);
-    
-    // Check all buttons
+
     ButtonWidget* allButtons[] = {
       diceButtons[0], diceButtons[1], diceButtons[2], diceButtons[3],
       diceButtons[4], diceButtons[5], diceButtons[6],
       quantityUpBtn, quantityDownBtn, rollBtn
     };
     int totalButtons = 10;
-    
+
     if (touched) {
+      lastActivityTime = millis();
       for (int i = 0; i < totalButtons; i++) {
         if (allButtons[i]->contains(x, y)) {
-          allButtons[i]->press(true);
-          allButtons[i]->pressAction();
+          if (!allButtons[i]->isPressed()) {
+            // First press: fire immediately
+            allButtons[i]->press(true);
+            allButtons[i]->pressAction();
+            lastPressTime   = millis();
+            repeatTriggered = false;
+          } else {
+            // Held: auto-repeat only for quantity buttons
+            if (allButtons[i] == quantityUpBtn || allButtons[i] == quantityDownBtn) {
+              uint32_t held = millis() - lastPressTime;
+              uint32_t threshold = repeatTriggered ? 200UL : 600UL;
+              if (held >= threshold) {
+                allButtons[i]->pressAction();
+                lastPressTime   = millis();
+                repeatTriggered = true;
+              }
+            }
+          }
           break;
         }
       }
     } else {
-      // Release all buttons
-      for (int i = 0; i < totalButtons; i++) {
-        allButtons[i]->press(false);
-      }
+      for (int i = 0; i < totalButtons; i++) allButtons[i]->press(false);
+      repeatTriggered = false;
     }
-    
+
+    // Auto-sleep after 3 minutes of inactivity
+    if (millis() - lastActivityTime > SLEEP_TIMEOUT) {
+      tft.fillScreen(TFT_BLACK);
+      tft.setTextDatum(MC_DATUM);
+      tft.setTextSize(2);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.drawString("Buona notte...", 160, 120);
+      delay(1000);
+      tft.fillScreen(TFT_BLACK);
+      esp_sleep_enable_ext0_wakeup(GPIO_NUM_36, 0);
+      esp_deep_sleep_start();
+    }
+
     lastScan = millis();
   }
 }
