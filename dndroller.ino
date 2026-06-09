@@ -9,7 +9,14 @@ using namespace fs;
 #include <stdint.h>
 // Use ESP32 hardware RNG for unbiased dice rolls
 #include "esp_system.h"
-//#include "esp_random.h"
+#include "esp_sleep.h"
+
+// ── RGB LED (active-LOW on CYD) ──────────────────────────────────────────────
+#define LED_RED_PIN    4
+#define LED_GREEN_PIN  16
+#define LED_BLUE_PIN   17
+#define LED_DUTY_OFF   255   // active-LOW: 255 = off
+#define LED_DUTY_ON    204   // 80% duty = ~20% brightness
 
 #define CALIBRATION_FILE "/TouchCalData1"
 #define REPEAT_CAL false
@@ -30,31 +37,22 @@ int diceQuantity = 1;        // Number of dice to roll (1-10)
 int rollResults[10];         // Store individual dice results
 int totalResult = 0;         // Sum of all dice
 
-enum RollMode {
-  MODE_NORMAL = 0,
-  MODE_ADVANTAGE = 1,
-  MODE_DISADVANTAGE = 2
-};
-
-RollMode currentRollMode = MODE_NORMAL;
-
-static inline uint16_t getRollModeColor(RollMode mode) {
-  if (mode == MODE_ADVANTAGE) return TFT_GREEN;
-  if (mode == MODE_DISADVANTAGE) return TFT_RED;
-  return TFT_YELLOW;
-}
-
-static inline const char* getRollModeLabel(RollMode mode) {
-  if (mode == MODE_ADVANTAGE) return "Adv";
-  if (mode == MODE_DISADVANTAGE) return "Dis";
-  return "Norm";
-}
-
 // Button position storage for redrawing
 struct ButtonPos {
   int x, y, w, h;
 };
 ButtonPos diceButtonPos[7];
+
+// ── Karmic dice system ────────────────────────────────────────────────────────
+#define KARMA_HISTORY   10     // number of past rolls to track
+#define KARMA_STRENGTH  0.35f  // how strongly karma influences reroll chance (0=off, 1=max)
+#define KARMA_THRESHOLD 0.08f  // minimum karma imbalance before activating
+
+bool  useKarmicDice              = false;
+float karmaHistory[KARMA_HISTORY] = {0.5f};  // init neutral
+int   karmaCount                 = 0;
+
+ButtonWidget* rngModeBtn;
 
 // Unbiased uniform integer generation using ESP32 hardware RNG
 // Returns number in [minInclusive, maxInclusive]
@@ -73,6 +71,54 @@ static inline int uniformIntInclusive(int minInclusive, int maxInclusive) {
 static inline int rollUnbiasedDie(int sides) {
   if (sides <= 1) return 1;
   return uniformIntInclusive(1, sides);
+}
+
+// ── Karmic helpers ────────────────────────────────────────────────────────────
+
+void updateKarma(float normalizedRoll) {
+  // Store in circular buffer
+  karmaHistory[karmaCount % KARMA_HISTORY] = normalizedRoll;
+  karmaCount++;
+}
+
+float getKarmaAverage() {
+  int n = (karmaCount < KARMA_HISTORY) ? karmaCount : KARMA_HISTORY;
+  if (n == 0) return 0.5f;
+  float sum = 0.0f;
+  for (int i = 0; i < n; i++) sum += karmaHistory[i];
+  return sum / n;
+}
+
+// Roll one die respecting the current mode (pure RNG or karmic).
+// karma > 0 → been unlucky → low rolls may be rerolled once
+// karma < 0 → been lucky  → high rolls may be rerolled once
+int rollDie(int sides) {
+  if (sides <= 1) return 1;
+
+  int roll = rollUnbiasedDie(sides);
+
+  if (useKarmicDice) {
+    float karma    = 0.5f - getKarmaAverage();  // positive = unlucky
+    float normRoll = (float)(roll - 1) / (float)(sides - 1);  // [0,1]
+
+    bool lowRoll  = normRoll < 0.4f;
+    bool highRoll = normRoll > 0.6f;
+
+    // Reroll probability proportional to karma imbalance
+    float rerollProb = (fabsf(karma) - KARMA_THRESHOLD) * KARMA_STRENGTH;
+    if (rerollProb > 0.0f) {
+      float r = (float)(esp_random() & 0xFFFF) / 65535.0f;
+      bool doReroll = false;
+      if (karma >  KARMA_THRESHOLD && lowRoll  && r < rerollProb) doReroll = true;
+      if (karma < -KARMA_THRESHOLD && highRoll && r < rerollProb) doReroll = true;
+      if (doReroll) roll = rollUnbiasedDie(sides);
+    }
+
+    // Always update karma with the final result
+    updateKarma((float)(roll - 1) / (float)(sides - 1));
+  }
+
+  return roll;
 }
 
 // Helper to draw perfectly centered button labels (vertical + horizontal)
@@ -342,7 +388,9 @@ float angleZ = 0;
 bool animationActive = false;
 bool isRolling = false;  // Track if we're in rolling animation
 unsigned long lastAnimationTime = 0;
-unsigned long animationStartTime = 0;
+unsigned long animationStartTime  = 0;
+unsigned long lastActivityTime    = 0;
+const unsigned long SLEEP_TIMEOUT = 3UL * 60UL * 1000UL;
 
 // Global orthographic scale so all dice share the same on-screen size
 const float ORTHO_SCALE = 40.0f;  // tuned to roughly match D20 apparent size
@@ -357,25 +405,6 @@ void displayResults() {
   
   tft.setTextSize(2);
   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-
-  if (selectedDiceIndex == 5 && currentRollMode != MODE_NORMAL) {
-    int r1 = rollResults[0];
-    int r2 = rollResults[1];
-    uint16_t accent = (currentRollMode == MODE_ADVANTAGE) ? TFT_GREEN : TFT_RED;
-
-    tft.setCursor(130, 8);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.print("D20 ");
-    tft.setTextColor(accent, TFT_BLACK);
-    tft.print(getRollModeLabel(currentRollMode));
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.print(": ");
-    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.printf("%d / %d  ->  ", r1, r2);
-    tft.setTextColor(accent, TFT_BLACK);
-    tft.printf("%d", totalResult);
-    return;
-  }
   
   // Display results at top right
   if (diceQuantity > 1) {
@@ -385,8 +414,10 @@ void displayResults() {
     for (int i = 0; i < diceQuantity && i < 6; i++) { // Fewer to fit with bigger text
       tft.printf("%d ", rollResults[i]);
     }
-    if (diceQuantity > 6) tft.print("...");
-    
+    if (diceQuantity > 4 && diceQuantity < 7) tft.setTextSize(1);
+    if (diceQuantity > 6) {
+      tft.print("...");
+    }
     // Show total on second line
     tft.setCursor(130, 24);
     tft.setTextSize(2);
@@ -808,26 +839,19 @@ void rollDice() {
   angleX = 0;
   angleY = 0;
   angleZ = 0;
+
+  // Reset karma history on each new roll session
+  if (useKarmicDice) {
+    karmaCount = 0;
+    for (int i = 0; i < KARMA_HISTORY; i++) karmaHistory[i] = 0.5f;
+  }
   
   totalResult = 0;
   int sides = diceSides[selectedDiceIndex];
-
-  if (selectedDiceIndex == 5 && currentRollMode != MODE_NORMAL) {
-    int r1 = rollUnbiasedDie(sides);
-    int r2 = rollUnbiasedDie(sides);
-    rollResults[0] = r1;
-    rollResults[1] = r2;
-    if (currentRollMode == MODE_ADVANTAGE) {
-      totalResult = (r1 > r2) ? r1 : r2;
-    } else {
-      totalResult = (r1 < r2) ? r1 : r2;
-    }
-    return;
-  }
   
   // Roll multiple dice
   for (int i = 0; i < diceQuantity; i++) {
-    rollResults[i] = rollUnbiasedDie(sides);
+    rollResults[i] = rollDie(sides);
     totalResult += rollResults[i];
   }
   
@@ -847,10 +871,7 @@ void updateQuantityDisplay() {
 void updateDiceSelection() {
   // Update all dice button colors to show selection
   for (int i = 0; i < buttonCount; i++) {
-    uint16_t fill = TFT_BLUE;
-    if (i == selectedDiceIndex) {
-      fill = (i == 5) ? getRollModeColor(currentRollMode) : TFT_GREEN;
-    }
+    uint16_t fill = (i == selectedDiceIndex) ? TFT_GREEN : TFT_BLUE;
     diceButtons[i]->initButtonUL(diceButtonPos[i].x, diceButtonPos[i].y, 
                                  diceButtonPos[i].w, diceButtonPos[i].h,
                                  TFT_WHITE, fill, TFT_WHITE, "", 2);
@@ -867,14 +888,7 @@ void btn1_action() { selectedDiceIndex = 1; updateDiceSelection(); }
 void btn2_action() { selectedDiceIndex = 2; updateDiceSelection(); }
 void btn3_action() { selectedDiceIndex = 3; updateDiceSelection(); }
 void btn4_action() { selectedDiceIndex = 4; updateDiceSelection(); }
-void btn5_action() {
-  if (selectedDiceIndex == 5) {
-    currentRollMode = (RollMode)((currentRollMode + 1) % 3);
-  } else {
-    selectedDiceIndex = 5;
-  }
-  updateDiceSelection();
-}
+void btn5_action() { selectedDiceIndex = 5; updateDiceSelection(); }
 void btn6_action() { selectedDiceIndex = 6; updateDiceSelection(); }
 
 void quantityUp_action() {
@@ -896,9 +910,23 @@ void roll_action() {
 }
 
 void (*btnActions[])() = {
-  btn0_action, btn1_action, btn2_action, btn3_action, 
+  btn0_action, btn1_action, btn2_action, btn3_action,
   btn4_action, btn5_action, btn6_action
 };
+
+void rngMode_action() {
+  useKarmicDice = !useKarmicDice;
+  // Reset karma history when switching modes
+  karmaCount = 0;
+  for (int i = 0; i < KARMA_HISTORY; i++) karmaHistory[i] = 0.5f;
+  // Redraw button
+  uint16_t fill  = useKarmicDice ? TFT_GREEN  : (uint16_t)0x7BEF; // green or dark grey
+  uint16_t tcol  = useKarmicDice ? TFT_BLACK  : TFT_WHITE;
+  const char* lbl = useKarmicDice ? "KARMA ON" : "RNG PURO";
+  rngModeBtn->initButtonUL(125, 218, 195, 20, TFT_BLACK, fill, tcol, "", 1);
+  rngModeBtn->drawSmoothButton(false, 1, TFT_BLACK);
+  drawCenteredLabel(125, 218, 195, 20, lbl, 1, tcol, fill);
+}
 
 void setupDiceButtons() {
   // Left column - Rectangular dice buttons
@@ -948,6 +976,13 @@ void setupDiceButtons() {
   
   // Initial quantity display
   updateQuantityDisplay();
+
+  // RNG mode toggle button — bottom strip of right column
+  rngModeBtn = new ButtonWidget(&tft);
+  rngModeBtn->initButtonUL(125, 218, 195, 20, TFT_BLACK, (uint16_t)0x7BEF, TFT_WHITE, "", 1);
+  rngModeBtn->setPressAction(rngMode_action);
+  rngModeBtn->drawSmoothButton(false, 1, TFT_BLACK);
+  drawCenteredLabel(125, 218, 195, 20, "RNG PURO", 1, TFT_WHITE, (uint16_t)0x7BEF);
 }
 
 void touch_calibrate() {
@@ -962,7 +997,7 @@ void touch_calibrate() {
   if (LittleFS.exists(CALIBRATION_FILE)) {
     if (!REPEAT_CAL) {
       File f = LittleFS.open(CALIBRATION_FILE, "r");
-      if (f && f.readBytes((char *)calData, 14) == 14)
+      if (f && f.readBytes((char *)calData, sizeof(calData)) == sizeof(calData))
         calDataOK = true;
       f.close();
     } else {
@@ -982,7 +1017,7 @@ void touch_calibrate() {
     tft.calibrateTouch(calData, TFT_MAGENTA, TFT_BLACK, 15);
     File f = LittleFS.open(CALIBRATION_FILE, "w");
     if (f) {
-      f.write((const unsigned char *)calData, 14);
+      f.write((const unsigned char *)calData, sizeof(calData));
       f.close();
     }
     tft.setTouch(calData);
@@ -991,7 +1026,7 @@ void touch_calibrate() {
 
 void setup() {
   Serial.begin(115200);
-  randomSeed(analogRead(0));
+  // esp_random() used for dice — randomSeed() not needed
   tft.begin();
   tft.setRotation(1);  // Landscape 90° right
   tft.fillScreen(TFT_BLACK);
@@ -1040,6 +1075,16 @@ void setup() {
   buildIcosaFaces();
 
   touch_calibrate();
+
+  // LED: PWM cyan at 20% brightness
+  ledcAttach(LED_RED_PIN,   5000, 8);
+  ledcAttach(LED_GREEN_PIN, 5000, 8);
+  ledcAttach(LED_BLUE_PIN,  5000, 8);
+  ledcWrite(LED_RED_PIN,   LED_DUTY_OFF);
+  ledcWrite(LED_GREEN_PIN, LED_DUTY_ON);
+  ledcWrite(LED_BLUE_PIN,  LED_DUTY_ON);
+
+  lastActivityTime = millis();
   setupDiceButtons();
 }
 
@@ -1061,34 +1106,64 @@ void loop() {
     }
   }
   
-  static uint32_t lastScan = 0;
+  static uint32_t lastScan        = 0;
+  static uint32_t lastPressTime   = 0;
+  static bool     repeatTriggered = false;
+
   if (millis() - lastScan >= 50) {
     uint16_t x, y;
     bool touched = tft.getTouch(&x, &y);
-    
-    // Check all buttons
+
     ButtonWidget* allButtons[] = {
       diceButtons[0], diceButtons[1], diceButtons[2], diceButtons[3],
       diceButtons[4], diceButtons[5], diceButtons[6],
-      quantityUpBtn, quantityDownBtn, rollBtn
+      quantityUpBtn, quantityDownBtn, rollBtn, rngModeBtn
     };
-    int totalButtons = 10;
-    
+    int totalButtons = 11;
+
     if (touched) {
+      lastActivityTime = millis();
       for (int i = 0; i < totalButtons; i++) {
         if (allButtons[i]->contains(x, y)) {
-          allButtons[i]->press(true);
-          allButtons[i]->pressAction();
+          if (!allButtons[i]->isPressed()) {
+            // First press: fire immediately
+            allButtons[i]->press(true);
+            allButtons[i]->pressAction();
+            lastPressTime   = millis();
+            repeatTriggered = false;
+          } else {
+            // Held: auto-repeat only for quantity buttons
+            if (allButtons[i] == quantityUpBtn || allButtons[i] == quantityDownBtn) {
+              uint32_t held = millis() - lastPressTime;
+              uint32_t threshold = repeatTriggered ? 200UL : 600UL;
+              if (held >= threshold) {
+                allButtons[i]->pressAction();
+                lastPressTime   = millis();
+                repeatTriggered = true;
+              }
+            }
+          }
           break;
         }
       }
     } else {
-      // Release all buttons
-      for (int i = 0; i < totalButtons; i++) {
-        allButtons[i]->press(false);
-      }
+      for (int i = 0; i < totalButtons; i++) allButtons[i]->press(false);
+      repeatTriggered = false;
     }
-    
+
+    // Auto-sleep after 3 minutes of inactivity
+    if (millis() - lastActivityTime > SLEEP_TIMEOUT) {
+      tft.fillScreen(TFT_BLACK);
+      tft.setTextDatum(MC_DATUM);
+      tft.setTextSize(2);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.drawString("Buona notte...", 160, 120);
+      delay(1000);
+      tft.fillScreen(TFT_BLACK);
+      esp_sleep_enable_ext0_wakeup(GPIO_NUM_36, 0);
+      esp_deep_sleep_start();
+    }
+
     lastScan = millis();
   }
 }
