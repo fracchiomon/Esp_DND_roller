@@ -11,6 +11,10 @@ using namespace fs;
 #include "esp_system.h"
 #include "esp_sleep.h"
 
+// ── Debug ─────────────────────────────────────────────────────────────────────
+// Set to true to enable Serial output (Serial Monitor + Serial Plotter)
+#define DEBUG_MODE true
+
 // ── RGB LED (active-LOW on CYD) ──────────────────────────────────────────────
 #define LED_RED_PIN    4
 #define LED_GREEN_PIN  16
@@ -47,6 +51,11 @@ ButtonPos diceButtonPos[7];
 #define KARMA_HISTORY   10     // number of past rolls to track
 #define KARMA_STRENGTH  0.35f  // how strongly karma influences reroll chance (0=off, 1=max)
 #define KARMA_THRESHOLD 0.08f  // minimum karma imbalance before activating
+
+// ── Advantage / Disadvantage (D20 only) ──────────────────────────────────────
+enum AdvState { ADV_NORMAL, ADV_VANTAGGIO, ADV_SVANTAGGIO };
+AdvState advState = ADV_NORMAL;
+ButtonWidget* advBtn;
 
 bool  useKarmicDice              = false;
 float karmaHistory[KARMA_HISTORY] = {0.5f};  // init neutral
@@ -116,6 +125,23 @@ int rollDie(int sides) {
 
     // Always update karma with the final result
     updateKarma((float)(roll - 1) / (float)(sides - 1));
+
+    if (DEBUG_MODE) {
+      float kAvg = getKarmaAverage();
+      float karma = 0.5f - kAvg;
+      Serial.printf("[KARMA] roll=%d/%d  norm=%.2f  karmaAvg=%.3f  karmaVal=%.3f\n",
+                    roll, sides,
+                    (float)(roll-1)/(float)(sides-1),
+                    kAvg, karma);
+    }
+  }
+
+  // Serial Plotter: print roll value (and karma avg if karmic mode active)
+  if (DEBUG_MODE) {
+    if (useKarmicDice)
+      Serial.printf("Roll:%d\tKarmaAvg:%.2f\n", roll, getKarmaAverage() * sides);
+    else
+      Serial.printf("Roll:%d\n", roll);
   }
 
   return roll;
@@ -704,11 +730,11 @@ void animateDice() {
   lastAnimationTime = millis();
   
   // Clear animation area
-  tft.fillRect(125, 45, 190, 130, TFT_BLACK);
+  tft.fillRect(125, 45, 190, 120, TFT_BLACK);
   
   // Clip drawing to the dice area to prevent edge popping/flicker
   // Use absolute coordinates (vpDatum=false) so our projected points remain screen-based
-  tft.setViewport(125, 45, 190, 130, false);
+  tft.setViewport(125, 45, 190, 120, false);
   
   // Variable rotation speed based on state
   if (isRolling) {
@@ -718,7 +744,7 @@ void animateDice() {
     angleZ += 0.2;
   } else if (animationActive) {
     // Slow down after roll
-    float slowdownFactor = 1.0 - ((millis() - animationStartTime - 2000) / 1000.0);
+    float slowdownFactor = 1.0 - ((millis() - animationStartTime - 1000) / 500.0);
     if (slowdownFactor < 0.1) slowdownFactor = 0.1;
     angleX += 0.3 * slowdownFactor;
     angleY += 0.25 * slowdownFactor;
@@ -848,10 +874,19 @@ void rollDice() {
   
   totalResult = 0;
   int sides = diceSides[selectedDiceIndex];
-  
-  // Roll multiple dice
+  bool useAdv = (selectedDiceIndex == 5 && advState != ADV_NORMAL);
+
   for (int i = 0; i < diceQuantity; i++) {
-    rollResults[i] = rollDie(sides);
+    if (useAdv) {
+      int r1 = rollDie(sides);
+      int r2 = rollDie(sides);
+      if (DEBUG_MODE)
+        Serial.printf("[ADV] r1=%d r2=%d -> %s\n",
+          r1, r2, (advState==ADV_VANTAGGIO)?"VANTAGGIO":"SVANTAGGIO");
+      rollResults[i] = (advState == ADV_VANTAGGIO) ? max(r1, r2) : min(r1, r2);
+    } else {
+      rollResults[i] = rollDie(sides);
+    }
     totalResult += rollResults[i];
   }
   
@@ -882,14 +917,48 @@ void updateDiceSelection() {
   }
 }
 
+// ── LED state ─────────────────────────────────────────────────────────────────
+// active-LOW: 0 = full ON, 255 = OFF
+// Non-D20: cyan 20%.  D20: yellow/green/red full brightness per adv state.
+
+void ledApplyState() {
+  if (selectedDiceIndex != 5) {
+    // Not D20 — fixed cyan at 20% brightness
+    ledcWrite(LED_RED_PIN,   LED_DUTY_OFF);
+    ledcWrite(LED_GREEN_PIN, LED_DUTY_ON);
+    ledcWrite(LED_BLUE_PIN,  LED_DUTY_ON);
+  } else {
+    switch (advState) {
+      case ADV_NORMAL:
+        // Yellow = Red + Green full
+        ledcWrite(LED_RED_PIN,   0);
+        ledcWrite(LED_GREEN_PIN, 0);
+        ledcWrite(LED_BLUE_PIN,  255);
+        break;
+      case ADV_VANTAGGIO:
+        // Green full
+        ledcWrite(LED_RED_PIN,   255);
+        ledcWrite(LED_GREEN_PIN, 0);
+        ledcWrite(LED_BLUE_PIN,  255);
+        break;
+      case ADV_SVANTAGGIO:
+        // Red full
+        ledcWrite(LED_RED_PIN,   0);
+        ledcWrite(LED_GREEN_PIN, 255);
+        ledcWrite(LED_BLUE_PIN,  255);
+        break;
+    }
+  }
+}
+
 // Dice selection actions
-void btn0_action() { selectedDiceIndex = 0; updateDiceSelection(); }
-void btn1_action() { selectedDiceIndex = 1; updateDiceSelection(); }
-void btn2_action() { selectedDiceIndex = 2; updateDiceSelection(); }
-void btn3_action() { selectedDiceIndex = 3; updateDiceSelection(); }
-void btn4_action() { selectedDiceIndex = 4; updateDiceSelection(); }
-void btn5_action() { selectedDiceIndex = 5; updateDiceSelection(); }
-void btn6_action() { selectedDiceIndex = 6; updateDiceSelection(); }
+void btn0_action() { selectedDiceIndex = 0; updateDiceSelection(); advState = ADV_NORMAL; updateAdvButton(); ledApplyState(); }
+void btn1_action() { selectedDiceIndex = 1; updateDiceSelection(); advState = ADV_NORMAL; updateAdvButton(); ledApplyState(); }
+void btn2_action() { selectedDiceIndex = 2; updateDiceSelection(); advState = ADV_NORMAL; updateAdvButton(); ledApplyState(); }
+void btn3_action() { selectedDiceIndex = 3; updateDiceSelection(); advState = ADV_NORMAL; updateAdvButton(); ledApplyState(); }
+void btn4_action() { selectedDiceIndex = 4; updateDiceSelection(); advState = ADV_NORMAL; updateAdvButton(); ledApplyState(); }
+void btn5_action() { selectedDiceIndex = 5; updateDiceSelection(); advState = ADV_NORMAL; updateAdvButton(); ledApplyState(); }
+void btn6_action() { selectedDiceIndex = 6; updateDiceSelection(); advState = ADV_NORMAL; updateAdvButton(); ledApplyState(); }
 
 void quantityUp_action() {
   if (diceQuantity < 10) {
@@ -913,6 +982,37 @@ void (*btnActions[])() = {
   btn0_action, btn1_action, btn2_action, btn3_action,
   btn4_action, btn5_action, btn6_action
 };
+
+void updateAdvButton() {
+  uint16_t fill; uint16_t tcol; const char* lbl;
+  if (selectedDiceIndex != 5) {
+    fill = 0x4208; tcol = 0x8410; lbl = "ADV  solo D20";  // dark grey, inactive
+  } else {
+    switch (advState) {
+      case ADV_NORMAL:
+        fill = tft.color565(180,130,0); tcol = TFT_WHITE; lbl = "D20: NORMALE"; break;
+      case ADV_VANTAGGIO:
+        fill = TFT_GREEN;  tcol = TFT_BLACK; lbl = "D20: VANTAGGIO"; break;
+      case ADV_SVANTAGGIO:
+        fill = TFT_RED;    tcol = TFT_WHITE; lbl = "D20: SVANTAGGIO"; break;
+      default:
+        fill = 0x4208; tcol = TFT_WHITE; lbl = ""; break;
+    }
+  }
+  advBtn->initButtonUL(125, 167, 195, 11, TFT_BLACK, fill, tcol, "", 1);
+  advBtn->drawSmoothButton(false, 1, TFT_BLACK);
+  drawCenteredLabel(125, 167, 195, 11, lbl, 1, tcol, fill);
+}
+
+void advMode_action() {
+  if (selectedDiceIndex != 5) return;  // only active for D20
+  advState = (AdvState)((advState + 1) % 3);
+  updateAdvButton();
+  ledApplyState();
+  if (DEBUG_MODE)
+    Serial.printf("[ADV] stato -> %s\n",
+      advState==ADV_NORMAL?"NORMALE": advState==ADV_VANTAGGIO?"VANTAGGIO":"SVANTAGGIO");
+}
 
 void rngMode_action() {
   useKarmicDice = !useKarmicDice;
@@ -977,6 +1077,13 @@ void setupDiceButtons() {
   // Initial quantity display
   updateQuantityDisplay();
 
+  // Advantage/Disadvantage toggle — thin strip above ROLL area
+  advBtn = new ButtonWidget(&tft);
+  advBtn->initButtonUL(125, 167, 195, 11, TFT_BLACK, (uint16_t)0x4208, (uint16_t)0x8410, "", 1);
+  advBtn->setPressAction(advMode_action);
+  advBtn->drawSmoothButton(false, 1, TFT_BLACK);
+  drawCenteredLabel(125, 167, 195, 11, "ADV  solo D20", 1, (uint16_t)0x8410, (uint16_t)0x4208);
+
   // RNG mode toggle button — bottom strip of right column
   rngModeBtn = new ButtonWidget(&tft);
   rngModeBtn->initButtonUL(125, 218, 195, 20, TFT_BLACK, (uint16_t)0x7BEF, TFT_WHITE, "", 1);
@@ -1027,6 +1134,10 @@ void touch_calibrate() {
 void setup() {
   Serial.begin(115200);
   // esp_random() used for dice — randomSeed() not needed
+  if (DEBUG_MODE) {
+    Serial.println("=== DnD Roller DEBUG MODE ===");
+    Serial.println("Serial Plotter: Roll / KarmaAvg");
+  }
   tft.begin();
   tft.setRotation(1);  // Landscape 90° right
   tft.fillScreen(TFT_BLACK);
@@ -1080,9 +1191,7 @@ void setup() {
   ledcAttach(LED_RED_PIN,   5000, 8);
   ledcAttach(LED_GREEN_PIN, 5000, 8);
   ledcAttach(LED_BLUE_PIN,  5000, 8);
-  ledcWrite(LED_RED_PIN,   LED_DUTY_OFF);
-  ledcWrite(LED_GREEN_PIN, LED_DUTY_ON);
-  ledcWrite(LED_BLUE_PIN,  LED_DUTY_ON);
+  ledApplyState();  // cyan at 20% (no D20 selected yet)
 
   lastActivityTime = millis();
   setupDiceButtons();
@@ -1094,12 +1203,12 @@ void loop() {
     animateDice();
     
     // Check if rolling animation should transition to slowdown
-    if (isRolling && (millis() - animationStartTime > 2000)) {
+    if (isRolling && (millis() - animationStartTime > 1000)) {
       isRolling = false;  // Stop fast spin after 2 seconds
     }
     
     // Check if animation should end and show results
-    if (!resultsShown && animationActive && (millis() - animationStartTime > 3000)) {
+    if (!resultsShown && animationActive && (millis() - animationStartTime > 1500)) {
       animationActive = false;
       resultsShown = true;
       displayResults();
@@ -1117,9 +1226,9 @@ void loop() {
     ButtonWidget* allButtons[] = {
       diceButtons[0], diceButtons[1], diceButtons[2], diceButtons[3],
       diceButtons[4], diceButtons[5], diceButtons[6],
-      quantityUpBtn, quantityDownBtn, rollBtn, rngModeBtn
+      quantityUpBtn, quantityDownBtn, rollBtn, rngModeBtn, advBtn
     };
-    int totalButtons = 11;
+    int totalButtons = 12;
 
     if (touched) {
       lastActivityTime = millis();
