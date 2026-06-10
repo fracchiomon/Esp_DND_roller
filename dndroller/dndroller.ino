@@ -38,11 +38,11 @@ uint8_t buttonCount = 7;
 // Game state variables
 int diceRolledSinceStart = 0;
 const uint8_t MAX_ROLLS_AVAILABLE = 20;
-int selectedDiceIndex = -1;                   // Track which dice is selected
-int diceQuantity = 1;                         // Number of dice to roll (1-10)
 int rollResults[MAX_ROLLS_AVAILABLE];         // Store individual dice results
-int totalResult = 0;                          // Sum of all dice
-int advRoll1 = 0, advRoll2 = 0;               // Both dice when adv/disadv active
+int selectedDiceIndex = -1;  // Track which dice is selected
+int diceQuantity = 1;        // Number of dice to roll (1-10)
+int totalResult = 0;         // Sum of all dice
+int advRoll1 = 0, advRoll2 = 0;  // Both dice when adv/disadv active
 
 // Button position storage for redrawing
 struct ButtonPos {
@@ -51,20 +51,34 @@ struct ButtonPos {
 ButtonPos diceButtonPos[7];
 
 // ── Karmic dice system ────────────────────────────────────────────────────────
-#define KARMA_HISTORY   10     // number of past rolls to track
-#define KARMA_STRENGTH  0.45f  // how strongly karma influences reroll chance (0=off, 1=max)
-#define KARMA_THRESHOLD 0.08f  // minimum karma imbalance before activating
-
 // ── Advantage / Disadvantage (D20 only) ──────────────────────────────────────
 enum AdvState { ADV_NORMAL, ADV_VANTAGGIO, ADV_SVANTAGGIO };
 AdvState advState = ADV_NORMAL;
 ButtonWidget* advBtn;
 
-bool  useKarmicDice              = false;
-float karmaHistory[KARMA_HISTORY] = {0.5f};  // init neutral
-int   karmaCount                 = 0;
+// ── BG3 Karmic dice system ────────────────────────────────────────────────────
+// Source: https://bg3.wiki/wiki/Karmic_dice
+//
+// The system tracks a "debt" value. When a roll fails, p (probability of
+// success) is added to debt. On subsequent rolls with debt > 0, a hidden roll
+// determines if the die automatically succeeds with probability p/(1-debt).
+// On auto-success, a value in [DC, sides] is chosen randomly, and
+// 2*(1-p) is subtracted from debt.
+//
+// DC (Difficulty Class) must be known to compute p. Settable via serial: "dc N"
+// Default: just above median of the die (e.g. DC 11 for D20 = 50% chance).
+
+bool  useKarmicDice = false;
+float karmicDebt    = 0.0f;   // accumulated debt (BG3 algorithm)
+int   targetDC      = -1;     // -1 = auto (median+1), else user-set value
 
 ButtonWidget* rngModeBtn;
+
+// Returns the effective DC for a given die (auto mode = median+1)
+int effectiveDC(int sides) {
+  if (targetDC > 0 && targetDC <= sides) return targetDC;
+  return sides / 2 + 1;  // just above median: ~50% success rate
+}
 
 // Unbiased uniform integer generation using ESP32 hardware RNG
 // Returns number in [minInclusive, maxInclusive]
@@ -85,64 +99,57 @@ static inline int rollUnbiasedDie(int sides) {
   return uniformIntInclusive(1, sides);
 }
 
-// ── Karmic helpers ────────────────────────────────────────────────────────────
-
-void updateKarma(float normalizedRoll) {
-  // Store in circular buffer
-  karmaHistory[karmaCount % KARMA_HISTORY] = normalizedRoll;
-  karmaCount++;
-}
-
-float getKarmaAverage() {
-  int n = (karmaCount < KARMA_HISTORY) ? karmaCount : KARMA_HISTORY;
-  if (n == 0) return 0.5f;
-  float sum = 0.0f;
-  for (int i = 0; i < n; i++) sum += karmaHistory[i];
-  return sum / n;
-}
-
-// Roll one die respecting the current mode (pure RNG or karmic).
-// karma > 0 → been unlucky → low rolls may be rerolled once
-// karma < 0 → been lucky  → high rolls may be rerolled once
+// Roll one die using the BG3 karmic algorithm (requires DC to compute p).
+// If useKarmicDice is false, falls back to pure unbiased RNG.
 int rollDie(int sides) {
   if (sides <= 1) return 1;
 
-  int roll = rollUnbiasedDie(sides);
+  int roll;
 
   if (useKarmicDice) {
-    float karma    = 0.5f - getKarmaAverage();  // positive = unlucky
-    float normRoll = (float)(roll - 1) / (float)(sides - 1);  // [0,1]
+    int   dc = effectiveDC(sides);
+    float p  = (float)(sides - dc + 1) / (float)sides;  // prob of success
 
-    bool lowRoll  = normRoll < 0.4f;
-    bool highRoll = normRoll > 0.6f;
+    if (karmicDebt > 0.0f) {
+      // Hidden roll: does this succeed automatically?
+      float autoProb  = p / (1.0f - karmicDebt);
+      if (autoProb > 1.0f) autoProb = 1.0f;
+      float hiddenRoll = (float)(esp_random() & 0xFFFF) / 65535.0f;
 
-    // Reroll probability proportional to karma imbalance
-    float rerollProb = (fabsf(karma) - KARMA_THRESHOLD) * KARMA_STRENGTH;
-    if (rerollProb > 0.0f) {
-      float r = (float)(esp_random() & 0xFFFF) / 65535.0f;
-      bool doReroll = false;
-      if (karma >  KARMA_THRESHOLD && lowRoll  && r < rerollProb) doReroll = true;
-      if (karma < -KARMA_THRESHOLD && highRoll && r < rerollProb) doReroll = true;
-      if (doReroll) roll = rollUnbiasedDie(sides);
+      if (hiddenRoll < autoProb) {
+        // Auto success: pick random value from [dc, sides]
+        roll = uniformIntInclusive(dc, sides);
+        karmicDebt -= 2.0f * (1.0f - p);
+        if (DEBUG_MODE)
+          Serial.printf("[KARMA] AUTO SUCCESS roll=%d  dc=%d  p=%.3f  debt=%.4f\n",
+                        roll, dc, p, karmicDebt);
+        // Plotter
+        if (DEBUG_MODE) Serial.printf("Roll:%d\tDebt:%.3f\n", roll, karmicDebt);
+        return roll;
+      }
     }
 
-    // Always update karma with the final result
-    updateKarma((float)(roll - 1) / (float)(sides - 1));
-
-    if (DEBUG_MODE) {
-      float kAvg = getKarmaAverage();
-      float karma = 0.5f - kAvg;
-      Serial.printf("[KARMA] roll=%d/%d  norm=%.2f  karmaAvg=%.3f  karmaVal=%.3f\n",
-                    roll, sides,
-                    (float)(roll-1)/(float)(sides-1),
-                    kAvg, karma);
+    // Normal roll
+    roll = rollUnbiasedDie(sides);
+    if (roll < dc) {
+      // Failed: accumulate debt
+      karmicDebt += p;
+      if (DEBUG_MODE)
+        Serial.printf("[KARMA] FAIL roll=%d  dc=%d  p=%.3f  debt+=%.3f -> %.4f\n",
+                      roll, dc, p, p, karmicDebt);
+    } else {
+      if (DEBUG_MODE)
+        Serial.printf("[KARMA] SUCCESS roll=%d  dc=%d  p=%.3f  debt=%.4f\n",
+                      roll, dc, p, karmicDebt);
     }
+  } else {
+    roll = rollUnbiasedDie(sides);
   }
 
-  // Serial Plotter: print roll value (and karma avg if karmic mode active)
+  // Serial Plotter
   if (DEBUG_MODE) {
     if (useKarmicDice)
-      Serial.printf("Roll:%d\tKarmaAvg:%.2f\n", roll, getKarmaAverage() * sides);
+      Serial.printf("Roll:%d\tDebt:%.3f\n", roll, karmicDebt);
     else
       Serial.printf("Roll:%d\n", roll);
   }
@@ -430,6 +437,7 @@ void displayResults() {
   // Clear results area (top right, where ROLL button used to be)
   tft.fillRect(125, 5, 190, 35, TFT_BLACK);
   Serial.printf("Dice rolled since start: %d\n", diceRolledSinceStart);
+  
   if (selectedDiceIndex == -1) return;
   
   tft.setTextSize(2);
@@ -892,11 +900,7 @@ void rollDice() {
   angleY = 0;
   angleZ = 0;
 
-  // Reset karma history on each new roll session
-  if (useKarmicDice) {
-    karmaCount = 0;
-    for (int i = 0; i < KARMA_HISTORY; i++) karmaHistory[i] = 0.5f;
-  }
+  // BG3 karma: debt persists across roll sessions (intentional — tracks long-term luck)
   
   totalResult = 0;
   int sides = diceSides[selectedDiceIndex];
@@ -1048,9 +1052,8 @@ void advMode_action() {
 
 void rngMode_action() {
   useKarmicDice = !useKarmicDice;
-  // Reset karma history when switching modes
-  karmaCount = 0;
-  for (int i = 0; i < KARMA_HISTORY; i++) karmaHistory[i] = 0.5f;
+  // Reset debt when switching modes
+  karmicDebt = 0.0f;
   // Redraw button
   uint16_t fill  = useKarmicDice ? TFT_GREEN  : (uint16_t)0x7BEF; // green or dark grey
   uint16_t tcol  = useKarmicDice ? TFT_BLACK  : TFT_WHITE;
@@ -1247,9 +1250,13 @@ void printStatus() {
   Serial.printf("  Quantita:  %d\n", diceQuantity);
   Serial.printf("  Karma:     %s\n", useKarmicDice ? "ON" : "OFF");
   if (useKarmicDice) {
-    float avg = getKarmaAverage();
-    Serial.printf("  KarmaAvg:  %.3f  (0.5=neutro, >0.5=fortunato, <0.5=sfortunato)\n", avg);
-    Serial.printf("  Lanci tracciati: %d/%d\n", karmaCount < KARMA_HISTORY ? karmaCount : KARMA_HISTORY, KARMA_HISTORY);
+    int sides = (selectedDiceIndex >= 0) ? diceSides[selectedDiceIndex] : 20;
+    int dc    = effectiveDC(sides);
+    float p   = (float)(sides - dc + 1) / (float)sides;
+    Serial.printf("  Debt:      %.4f\n", karmicDebt);
+    Serial.printf("  DC:        %d %s  (p=%.1f%%)\n",
+                  dc, targetDC < 0 ? "(auto)" : "(manuale)", p * 100.0f);
+    Serial.println("  Nota: debt>0 aumenta chance successo automatico");
   }
   const char* advNames[] = {"NORMALE", "VANTAGGIO", "SVANTAGGIO"};
   Serial.printf("  Vantaggio: %s\n", advNames[advState]);
@@ -1279,8 +1286,8 @@ void handleSerialCommand(String cmd) {
   // ── Quantity: qty <n> ──
   else if (cmd.startsWith("qty ")) {
     int val = cmd.substring(4).toInt();
-    if (val < 1 || val > 20) {
-      Serial.printf("[CMD] Errore: quantita' deve essere 1-20 (ricevuto: %d)\n", val);
+    if (val < 1 || val > 10) {
+      Serial.printf("[CMD] Errore: quantita' deve essere 1-10 (ricevuto: %d)\n", val);
     } else {
       diceQuantity = val;
       updateQuantityDisplay();
@@ -1304,20 +1311,32 @@ void handleSerialCommand(String cmd) {
 
   // ── Karma ──
   else if (cmd == "karma on")  {
-    useKarmicDice = true;
-    rngMode_action();  // reuses existing toggle — call twice if already on
-    if (!useKarmicDice) rngMode_action();  // ensure it's ON
-    useKarmicDice = true;
+    if (!useKarmicDice) rngMode_action();
     Serial.println("[CMD] Karma ON");
   }
   else if (cmd == "karma off") {
-    useKarmicDice = false;
+    if (useKarmicDice) rngMode_action();
     Serial.println("[CMD] Karma OFF");
   }
   else if (cmd == "karma reset") {
-    karmaCount = 0;
-    for (int i = 0; i < KARMA_HISTORY; i++) karmaHistory[i] = 0.5f;
-    Serial.println("[CMD] Storia karmica resettata");
+    karmicDebt = 0.0f;
+    Serial.println("[CMD] Debt karmico azzerato");
+  }
+  // dc <n>: set difficulty class
+  else if (cmd.startsWith("dc ")) {
+    int val = cmd.substring(3).toInt();
+    int sides = (selectedDiceIndex >= 0) ? diceSides[selectedDiceIndex] : 20;
+    if (val < 1 || val > sides) {
+      Serial.printf("[CMD] Errore: DC deve essere 1-%d per il dado selezionato\n", sides);
+    } else {
+      targetDC = val;
+      float p = (float)(sides - targetDC + 1) / (float)sides;
+      Serial.printf("[CMD] DC impostato a %d  (p=%.1f%%)\n", targetDC, p * 100.0f);
+    }
+  }
+  else if (cmd == "dc auto") {
+    targetDC = -1;
+    Serial.println("[CMD] DC impostato su auto (mediana+1)");
   }
 
   // ── Status ──
@@ -1330,7 +1349,8 @@ void handleSerialCommand(String cmd) {
     Serial.println("  roll                        — esegui lancio");
     Serial.println("  qty <1-20>                  — imposta quantita'");
     Serial.println("  adv / disadv / normal       — vantaggio D20");
-    Serial.println("  karma on/off/reset          — sistema karmico");
+    Serial.println("  karma on/off/reset          — sistema karmico BG3");
+    Serial.println("  dc <n> / dc auto            — imposta Difficulty Class");
     Serial.println("  status                      — stato sistema");
   }
 
@@ -1340,7 +1360,7 @@ void handleSerialCommand(String cmd) {
 }
 
 void loop() {
-  // ── Serial command input ── 
+  // ── Serial command input ──
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     handleSerialCommand(cmd);
