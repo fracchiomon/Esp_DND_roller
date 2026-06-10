@@ -439,7 +439,7 @@ bool isRolling = false;  // Track if we're in rolling animation
 unsigned long lastAnimationTime = 0;
 unsigned long animationStartTime  = 0;
 unsigned long lastActivityTime    = 0;
-const unsigned long SLEEP_TIMEOUT = 3UL * 60UL * 1000UL;
+const unsigned long SLEEP_TIMEOUT = 5UL * 60UL * 1000UL;
 
 // Global orthographic scale so all dice share the same on-screen size
 const float ORTHO_SCALE = 40.0f;  // tuned to roughly match D20 apparent size
