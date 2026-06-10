@@ -10,6 +10,20 @@ using namespace fs;
 // Use ESP32 hardware RNG for unbiased dice rolls
 #include "esp_system.h"
 #include "esp_sleep.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Update.h>
+
+// ── OTA Web Updater ───────────────────────────────────────────────────────────
+// Change credentials before first flash; after that update via http://<ip>/update
+#define WIFI_SSID   "YourSSID"
+#define WIFI_PASS   "YourPassword"
+#define OTA_PORT    80
+
+WebServer otaServer(OTA_PORT);
+bool      wifiConnected = false;
+String    deviceIP      = "";
+bool      otaInProgress = false;
 
 // ── Debug ─────────────────────────────────────────────────────────────────────
 // Set to true to enable Serial output (Serial Monitor + Serial Plotter)
@@ -1127,6 +1141,188 @@ void setupDiceButtons() {
   drawCenteredLabel(125, 218, 195, 20, "RNG PURO", 1, TFT_WHITE, (uint16_t)0x7BEF);
 }
 
+
+// ── OTA page (served at http://<ip>/) ────────────────────────────────────────
+static const char OTA_HTML[] PROGMEM = R"rawhtml(
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DnD Roller OTA</title>
+<style>
+  body{font-family:sans-serif;background:#1a1a2e;color:#eee;text-align:center;padding:40px}
+  h1{color:#e94560}
+  .card{background:#16213e;border-radius:12px;padding:30px;max-width:480px;margin:0 auto}
+  input[type=file]{margin:16px 0;color:#aaa}
+  .btn{background:#e94560;color:#fff;border:none;padding:12px 32px;border-radius:6px;
+       cursor:pointer;font-size:16px;margin-top:16px}
+  .btn:hover{background:#c73652}
+  progress{width:90%;height:22px;margin:16px auto;display:none;border-radius:4px}
+  #status{margin-top:12px;font-size:14px;color:#aaa;min-height:20px}
+</style></head><body>
+<div class="card">
+  <h1>&#127922; DnD Roller OTA</h1>
+  <p>Seleziona il <b>.bin</b> esportato da Arduino IDE<br>
+  <small>(Sketch → Esporta binario compilato)</small></p>
+  <input type="file" id="file" accept=".bin">
+  <br>
+  <button class="btn" onclick="upload()">Flasha firmware</button>
+  <br>
+  <progress id="prog" max="100" value="0"></progress>
+  <div id="status"></div>
+</div>
+<script>
+function upload(){
+  var f=document.getElementById('file').files[0];
+  if(!f){alert('Seleziona un file .bin');return;}
+  var fd=new FormData();fd.append('firmware',f);
+  var xhr=new XMLHttpRequest();
+  xhr.upload.onprogress=function(e){
+    var p=Math.round(e.loaded/e.total*100);
+    document.getElementById('prog').style.display='block';
+    document.getElementById('prog').value=p;
+    document.getElementById('status').textContent='Caricamento: '+p+'%';
+  };
+  xhr.onload=function(){
+    if(xhr.status===200){
+      document.getElementById('status').textContent='✓ Completato! Il dispositivo si riavvierà...';
+      document.getElementById('prog').value=100;
+    } else {
+      document.getElementById('status').textContent='✗ Errore: '+xhr.responseText;
+    }
+  };
+  xhr.onerror=function(){
+    document.getElementById('status').textContent='✗ Connessione persa';
+  };
+  xhr.open('POST','/update');xhr.send(fd);
+}
+</script></body></html>
+)rawhtml";
+
+void otaHandleRoot() {
+  otaServer.send_P(200, "text/html", OTA_HTML);
+}
+
+void otaHandleUpload() {
+  HTTPUpload& upload = otaServer.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    otaInProgress = true;
+    // Show OTA screen on TFT
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.drawString("OTA Update", 160, 90);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(upload.filename.c_str(), 160, 115);
+    Serial.printf("[OTA] Avvio: %s\n", upload.filename.c_str());
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      Update.printError(Serial);
+    }
+
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      Update.printError(Serial);
+    }
+    // Progress bar on TFT (estimate from content length if available)
+    if (upload.contentLength > 0) {
+      int pct = (int)(upload.totalSize * 100 / upload.contentLength);
+      // Draw bar background once; fill proportionally
+      tft.fillRect(40, 130, 240, 16, tft.color565(30,30,60));
+      tft.fillRect(40, 130, 240 * pct / 100, 16, TFT_CYAN);
+      char buf[12]; snprintf(buf, sizeof(buf), "%d%%", pct);
+      tft.setTextDatum(MC_DATUM);
+      tft.setTextSize(1);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.fillRect(140, 152, 40, 10, TFT_BLACK);
+      tft.drawString(buf, 160, 155);
+    }
+
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) {
+      Serial.printf("[OTA] Completato: %u byte\n", upload.totalSize);
+      tft.fillRect(40, 130, 240, 16, TFT_GREEN);
+      tft.setTextDatum(MC_DATUM);
+      tft.setTextColor(TFT_GREEN, TFT_BLACK);
+      tft.setTextSize(2);
+      tft.drawString("OK! Riavvio...", 160, 165);
+    } else {
+      Update.printError(Serial);
+      tft.setTextColor(TFT_RED, TFT_BLACK);
+      tft.setTextSize(1);
+      tft.drawString("ERRORE OTA", 160, 155);
+    }
+  }
+}
+
+void otaHandleUpdateEnd() {
+  otaServer.sendHeader("Connection", "close");
+  if (Update.hasError()) {
+    otaServer.send(500, "text/plain", String("ERRORE: ") + Update.errorString());
+  } else {
+    otaServer.send(200, "text/plain", "OK");
+    delay(1500);
+    ESP.restart();
+  }
+}
+
+void setupOTA() {
+  otaServer.on("/",       HTTP_GET,  otaHandleRoot);
+  otaServer.on("/update", HTTP_POST, otaHandleUpdateEnd, otaHandleUpload);
+  otaServer.begin();
+  Serial.printf("[OTA] Server avviato su http://%s/\n", deviceIP.c_str());
+}
+
+// WiFi + OTA init — called from setup()
+void setupWiFi() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Connessione WiFi...", 160, 110);
+  tft.drawString(WIFI_SSID, 160, 125);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 12000) {
+    delay(300);
+    tft.drawString(".", 160 + (int)((millis()-t0)/300) * 4, 140);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    deviceIP = WiFi.localIP().toString();
+    setupOTA();
+
+    // Show IP briefly
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.setTextSize(2);
+    tft.drawString("WiFi OK!", 160, 90);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString("OTA: http://" + deviceIP + "/", 160, 118);
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.drawString("Avvio tra 3s...", 160, 138);
+    Serial.printf("[WiFi] Connesso! IP: %s\n", deviceIP.c_str());
+    delay(3000);
+  } else {
+    // WiFi failed — continue without OTA
+    Serial.println("[WiFi] Timeout connessione — OTA non disponibile");
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.drawString("WiFi non disponibile", 160, 110);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString("Avvio offline...", 160, 128);
+    delay(2000);
+  }
+}
+
 void touch_calibrate() {
   uint16_t calData[5];
   bool calDataOK = false;
@@ -1220,6 +1416,7 @@ void setup() {
   // Build robust icosa triangular faces from edges (avoids indexing mismatch)
   buildIcosaFaces();
 
+  setupWiFi();
   touch_calibrate();
 
   // LED: PWM cyan at 20% brightness
@@ -1261,6 +1458,10 @@ void printStatus() {
   const char* advNames[] = {"NORMALE", "VANTAGGIO", "SVANTAGGIO"};
   Serial.printf("  Vantaggio: %s\n", advNames[advState]);
   Serial.printf("  DebugMode: %s\n", DEBUG_MODE ? "ON" : "OFF");
+  if (wifiConnected)
+    Serial.printf("  OTA:       http://%s/\n", deviceIP.c_str());
+  else
+    Serial.println("  OTA:       non disponibile");
   Serial.println("────────────────────────────────");
 }
 
@@ -1339,6 +1540,15 @@ void handleSerialCommand(String cmd) {
     Serial.println("[CMD] DC impostato su auto (mediana+1)");
   }
 
+  // ── OTA / IP ──
+  else if (cmd == "ip" || cmd == "ota") {
+    if (wifiConnected) {
+      Serial.printf("[OTA] http://%s/\n", deviceIP.c_str());
+    } else {
+      Serial.println("[OTA] WiFi non connesso");
+    }
+  }
+
   // ── Status ──
   else if (cmd == "status") { printStatus(); }
 
@@ -1352,6 +1562,7 @@ void handleSerialCommand(String cmd) {
     Serial.println("  karma on/off/reset          — sistema karmico BG3");
     Serial.println("  dc <n> / dc auto            — imposta Difficulty Class");
     Serial.println("  status                      — stato sistema");
+    Serial.println("  ip / ota                    — mostra indirizzo OTA");
   }
 
   else {
@@ -1360,6 +1571,9 @@ void handleSerialCommand(String cmd) {
 }
 
 void loop() {
+  // ── OTA handler ──
+  if (wifiConnected && !otaInProgress) otaServer.handleClient();
+
   // ── Serial command input ──
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
@@ -1367,7 +1581,7 @@ void loop() {
   }
 
   // Run dice animation continuously when a dice is selected
-  if (selectedDiceIndex != -1) {
+  if (selectedDiceIndex != -1 && !otaInProgress) {
     animateDice();
     
     // Check if rolling animation should transition to slowdown
