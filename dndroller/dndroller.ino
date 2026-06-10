@@ -36,11 +36,13 @@ int diceSides[7] = {4, 6, 8, 10, 12, 20, 100};
 uint8_t buttonCount = 7;
 
 // Game state variables
-int selectedDiceIndex = -1;  // Track which dice is selected
-int diceQuantity = 1;        // Number of dice to roll (1-10)
-int rollResults[10];         // Store individual dice results
-int totalResult = 0;         // Sum of all dice
-int advRoll1 = 0, advRoll2 = 0;  // Both dice when adv/disadv active
+int diceRolledSinceStart = 0;
+const uint8_t MAX_ROLLS_AVAILABLE = 20;
+int selectedDiceIndex = -1;                   // Track which dice is selected
+int diceQuantity = 1;                         // Number of dice to roll (1-10)
+int rollResults[MAX_ROLLS_AVAILABLE];         // Store individual dice results
+int totalResult = 0;                          // Sum of all dice
+int advRoll1 = 0, advRoll2 = 0;               // Both dice when adv/disadv active
 
 // Button position storage for redrawing
 struct ButtonPos {
@@ -50,7 +52,7 @@ ButtonPos diceButtonPos[7];
 
 // ── Karmic dice system ────────────────────────────────────────────────────────
 #define KARMA_HISTORY   10     // number of past rolls to track
-#define KARMA_STRENGTH  0.35f  // how strongly karma influences reroll chance (0=off, 1=max)
+#define KARMA_STRENGTH  0.45f  // how strongly karma influences reroll chance (0=off, 1=max)
 #define KARMA_THRESHOLD 0.08f  // minimum karma imbalance before activating
 
 // ── Advantage / Disadvantage (D20 only) ──────────────────────────────────────
@@ -427,7 +429,7 @@ const float D4_SCALE_FACTOR = 0.60f;  // shrink D4 further
 void displayResults() {
   // Clear results area (top right, where ROLL button used to be)
   tft.fillRect(125, 5, 190, 35, TFT_BLACK);
-  
+  Serial.printf("Dice rolled since start: %d\n", diceRolledSinceStart);
   if (selectedDiceIndex == -1) return;
   
   tft.setTextSize(2);
@@ -910,8 +912,10 @@ void rollDice() {
       Serial.printf("[ADV] dado1=%d  dado2=%d  usato=%d  (%s)\n",
         r1, r2, rollResults[i],
         (advState == ADV_VANTAGGIO) ? "VANTAGGIO" : "SVANTAGGIO");
+      diceRolledSinceStart += 2;
     } else {
       rollResults[i] = rollDie(sides);
+      diceRolledSinceStart++;
     }
     totalResult += rollResults[i];
   }
@@ -989,7 +993,7 @@ void btn5_action() { selectedDiceIndex = 5; updateDiceSelection(); advState = AD
 void btn6_action() { selectedDiceIndex = 6; updateDiceSelection(); advState = ADV_NORMAL; updateAdvButton(); ledApplyState(); }
 
 void quantityUp_action() {
-  if (diceQuantity < 10) {
+  if (diceQuantity < MAX_ROLLS_AVAILABLE) {
     diceQuantity++;
     updateQuantityDisplay();
   }
@@ -1275,8 +1279,8 @@ void handleSerialCommand(String cmd) {
   // ── Quantity: qty <n> ──
   else if (cmd.startsWith("qty ")) {
     int val = cmd.substring(4).toInt();
-    if (val < 1 || val > 10) {
-      Serial.printf("[CMD] Errore: quantita' deve essere 1-10 (ricevuto: %d)\n", val);
+    if (val < 1 || val > 20) {
+      Serial.printf("[CMD] Errore: quantita' deve essere 1-20 (ricevuto: %d)\n", val);
     } else {
       diceQuantity = val;
       updateQuantityDisplay();
@@ -1324,7 +1328,7 @@ void handleSerialCommand(String cmd) {
     Serial.println("Comandi disponibili:");
     Serial.println("  d4 d6 d8 d10 d12 d20 d100  — seleziona dado");
     Serial.println("  roll                        — esegui lancio");
-    Serial.println("  qty <1-10>                  — imposta quantita'");
+    Serial.println("  qty <1-20>                  — imposta quantita'");
     Serial.println("  adv / disadv / normal       — vantaggio D20");
     Serial.println("  karma on/off/reset          — sistema karmico");
     Serial.println("  status                      — stato sistema");
