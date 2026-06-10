@@ -40,6 +40,7 @@ int selectedDiceIndex = -1;  // Track which dice is selected
 int diceQuantity = 1;        // Number of dice to roll (1-10)
 int rollResults[10];         // Store individual dice results
 int totalResult = 0;         // Sum of all dice
+int advRoll1 = 0, advRoll2 = 0;  // Both dice when adv/disadv active
 
 // Button position storage for redrawing
 struct ButtonPos {
@@ -450,13 +451,36 @@ void displayResults() {
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
     tft.printf("Total: %d", totalResult);
   } else {
-    // Single die result - show prominently
-    tft.setCursor(130, 8);
-    tft.setTextSize(2);
-    tft.print("Result: ");
-    tft.setTextSize(3);
-    tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    tft.printf("%d", rollResults[0]);
+    if (selectedDiceIndex == 5 && advState != ADV_NORMAL) {
+      // D20 with advantage/disadvantage: show both dice, highlight the used one
+      const char* advLabel = (advState == ADV_VANTAGGIO) ? "VANT." : "SVAN.";
+      uint16_t c1 = (rollResults[0] == advRoll1) ? TFT_GREEN  : TFT_DARKGREY;
+      uint16_t c2 = (rollResults[0] == advRoll2) ? TFT_GREEN  : TFT_DARKGREY;
+      // Line 1: label + both values
+      tft.setCursor(130, 5);
+      tft.setTextSize(1);
+      tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+      tft.printf("%s  ", advLabel);
+      tft.setTextColor(c1, TFT_BLACK);
+      tft.printf("%d", advRoll1);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.print(" / ");
+      tft.setTextColor(c2, TFT_BLACK);
+      tft.printf("%d", advRoll2);
+      // Line 2: final result large
+      tft.setCursor(130, 17);
+      tft.setTextSize(2);
+      tft.setTextColor(TFT_GREEN, TFT_BLACK);
+      tft.printf("-> %d", rollResults[0]);
+    } else {
+      // Normal single die result
+      tft.setCursor(130, 8);
+      tft.setTextSize(2);
+      tft.print("Result: ");
+      tft.setTextSize(3);
+      tft.setTextColor(TFT_GREEN, TFT_BLACK);
+      tft.printf("%d", rollResults[0]);
+    }
   }
 }
 
@@ -880,10 +904,12 @@ void rollDice() {
     if (useAdv) {
       int r1 = rollDie(sides);
       int r2 = rollDie(sides);
-      if (DEBUG_MODE)
-        Serial.printf("[ADV] r1=%d r2=%d -> %s\n",
-          r1, r2, (advState==ADV_VANTAGGIO)?"VANTAGGIO":"SVANTAGGIO");
+      advRoll1 = r1; advRoll2 = r2;  // save for display
       rollResults[i] = (advState == ADV_VANTAGGIO) ? max(r1, r2) : min(r1, r2);
+      // Always print both dice when advantage/disadvantage is active
+      Serial.printf("[ADV] dado1=%d  dado2=%d  usato=%d  (%s)\n",
+        r1, r2, rollResults[i],
+        (advState == ADV_VANTAGGIO) ? "VANTAGGIO" : "SVANTAGGIO");
     } else {
       rollResults[i] = rollDie(sides);
     }
@@ -894,12 +920,14 @@ void rollDice() {
 }
 
 void updateQuantityDisplay() {
-  // Clear quantity display area (between - and + buttons)
-  tft.fillRect(252, 187, 16, 28, TFT_BLACK);
-  tft.setTextSize(2);
+  // Gap between "-" (x=220,w=30) and "+" (x=270,w=30): x=250, w=20, h=35
+  const int qx=250, qy=180, qw=20, qh=35;
+  tft.fillRect(qx, qy, qw, qh, TFT_BLACK);
+  uint8_t ts = (diceQuantity < 10) ? 2 : 1;  // shrink to size 1 for double digits
+  tft.setTextSize(ts);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextDatum(MC_DATUM);
-  tft.drawNumber(diceQuantity, 260, 201); // center of 16x28 area
+  tft.drawNumber(diceQuantity, qx + qw / 2, qy + qh / 2);
   tft.setTextDatum(TL_DATUM);
 }
 
@@ -1197,7 +1225,123 @@ void setup() {
   setupDiceButtons();
 }
 
+
+// ── Serial command handler ────────────────────────────────────────────────────
+// Available commands (send via Serial Monitor, line ending: Newline):
+//   d4 d6 d8 d10 d12 d20 d100  — select dice
+//   roll                        — execute a roll
+//   qty <1-10>                  — set dice quantity
+//   adv / disadv / normal       — set advantage state (D20 only)
+//   karma on / karma off        — toggle karmic system
+//   karma reset                 — reset karma history
+//   status                      — print current system state
+
+void printStatus() {
+  const char* diceNames[] = {"D4","D6","D8","D10","D12","D20","D100"};
+  Serial.println("──────────── STATUS ────────────");
+  Serial.printf("  Dado:      %s\n", selectedDiceIndex >= 0 ? diceNames[selectedDiceIndex] : "nessuno");
+  Serial.printf("  Quantita:  %d\n", diceQuantity);
+  Serial.printf("  Karma:     %s\n", useKarmicDice ? "ON" : "OFF");
+  if (useKarmicDice) {
+    float avg = getKarmaAverage();
+    Serial.printf("  KarmaAvg:  %.3f  (0.5=neutro, >0.5=fortunato, <0.5=sfortunato)\n", avg);
+    Serial.printf("  Lanci tracciati: %d/%d\n", karmaCount < KARMA_HISTORY ? karmaCount : KARMA_HISTORY, KARMA_HISTORY);
+  }
+  const char* advNames[] = {"NORMALE", "VANTAGGIO", "SVANTAGGIO"};
+  Serial.printf("  Vantaggio: %s\n", advNames[advState]);
+  Serial.printf("  DebugMode: %s\n", DEBUG_MODE ? "ON" : "OFF");
+  Serial.println("────────────────────────────────");
+}
+
+void handleSerialCommand(String cmd) {
+  cmd.trim();
+  cmd.toLowerCase();
+
+  // ── Dice selection ──
+  if      (cmd == "d4")   { btn0_action(); Serial.println("[CMD] Selezionato D4"); }
+  else if (cmd == "d6")   { btn1_action(); Serial.println("[CMD] Selezionato D6"); }
+  else if (cmd == "d8")   { btn2_action(); Serial.println("[CMD] Selezionato D8"); }
+  else if (cmd == "d10")  { btn3_action(); Serial.println("[CMD] Selezionato D10"); }
+  else if (cmd == "d12")  { btn4_action(); Serial.println("[CMD] Selezionato D12"); }
+  else if (cmd == "d20")  { btn5_action(); Serial.println("[CMD] Selezionato D20"); }
+  else if (cmd == "d100") { btn6_action(); Serial.println("[CMD] Selezionato D100"); }
+
+  // ── Roll ──
+  else if (cmd == "roll") {
+    if (selectedDiceIndex == -1) Serial.println("[CMD] Errore: nessun dado selezionato");
+    else { roll_action(); Serial.println("[CMD] Lancio eseguito"); }
+  }
+
+  // ── Quantity: qty <n> ──
+  else if (cmd.startsWith("qty ")) {
+    int val = cmd.substring(4).toInt();
+    if (val < 1 || val > 10) {
+      Serial.printf("[CMD] Errore: quantita' deve essere 1-10 (ricevuto: %d)\n", val);
+    } else {
+      diceQuantity = val;
+      updateQuantityDisplay();
+      Serial.printf("[CMD] Quantita' impostata a %d\n", diceQuantity);
+    }
+  }
+
+  // ── Advantage ──
+  else if (cmd == "adv") {
+    if (selectedDiceIndex != 5) Serial.println("[CMD] Vantaggio disponibile solo per D20");
+    else { advState = ADV_VANTAGGIO; updateAdvButton(); ledApplyState(); Serial.println("[CMD] Vantaggio attivato"); }
+  }
+  else if (cmd == "disadv") {
+    if (selectedDiceIndex != 5) Serial.println("[CMD] Svantaggio disponibile solo per D20");
+    else { advState = ADV_SVANTAGGIO; updateAdvButton(); ledApplyState(); Serial.println("[CMD] Svantaggio attivato"); }
+  }
+  else if (cmd == "normal") {
+    advState = ADV_NORMAL; updateAdvButton(); ledApplyState();
+    Serial.println("[CMD] Tiro normale");
+  }
+
+  // ── Karma ──
+  else if (cmd == "karma on")  {
+    useKarmicDice = true;
+    rngMode_action();  // reuses existing toggle — call twice if already on
+    if (!useKarmicDice) rngMode_action();  // ensure it's ON
+    useKarmicDice = true;
+    Serial.println("[CMD] Karma ON");
+  }
+  else if (cmd == "karma off") {
+    useKarmicDice = false;
+    Serial.println("[CMD] Karma OFF");
+  }
+  else if (cmd == "karma reset") {
+    karmaCount = 0;
+    for (int i = 0; i < KARMA_HISTORY; i++) karmaHistory[i] = 0.5f;
+    Serial.println("[CMD] Storia karmica resettata");
+  }
+
+  // ── Status ──
+  else if (cmd == "status") { printStatus(); }
+
+  // ── Help ──
+  else if (cmd == "help" || cmd == "?") {
+    Serial.println("Comandi disponibili:");
+    Serial.println("  d4 d6 d8 d10 d12 d20 d100  — seleziona dado");
+    Serial.println("  roll                        — esegui lancio");
+    Serial.println("  qty <1-10>                  — imposta quantita'");
+    Serial.println("  adv / disadv / normal       — vantaggio D20");
+    Serial.println("  karma on/off/reset          — sistema karmico");
+    Serial.println("  status                      — stato sistema");
+  }
+
+  else {
+    Serial.printf("[CMD] Comando non riconosciuto: '%s' (digita 'help' per la lista)\n", cmd.c_str());
+  }
+}
+
 void loop() {
+  // ── Serial command input ── 
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    handleSerialCommand(cmd);
+  }
+
   // Run dice animation continuously when a dice is selected
   if (selectedDiceIndex != -1) {
     animateDice();
