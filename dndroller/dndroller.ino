@@ -13,6 +13,7 @@ using namespace fs;
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Update.h>
+#include <secrets.h>
 
 // ── OTA Web Updater ───────────────────────────────────────────────────────────
 // Change credentials before first flash; after that update via http://<ip>/update
