@@ -16,8 +16,6 @@ using namespace fs;
 
 // ── OTA Web Updater ───────────────────────────────────────────────────────────
 // Change credentials before first flash; after that update via http://<ip>/update
-#define WIFI_SSID   "YourSSID"
-#define WIFI_PASS   "YourPassword"
 #define OTA_PORT    80
 
 WebServer otaServer(OTA_PORT);
@@ -1224,19 +1222,19 @@ void otaHandleUpload() {
     if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
       Update.printError(Serial);
     }
-    // Progress bar on TFT (estimate from content length if available)
-    if (upload.contentLength > 0) {
-      int pct = (int)(upload.totalSize * 100 / upload.contentLength);
-      // Draw bar background once; fill proportionally
-      tft.fillRect(40, 130, 240, 16, tft.color565(30,30,60));
-      tft.fillRect(40, 130, 240 * pct / 100, 16, TFT_CYAN);
-      char buf[12]; snprintf(buf, sizeof(buf), "%d%%", pct);
-      tft.setTextDatum(MC_DATUM);
-      tft.setTextSize(1);
-      tft.setTextColor(TFT_WHITE, TFT_BLACK);
-      tft.fillRect(140, 152, 40, 10, TFT_BLACK);
-      tft.drawString(buf, 160, 155);
-    }
+    // Animated progress: scrolling bar + KB counter
+    // (contentLength not available in ESP32 core 3.x HTTPUpload)
+    static uint8_t barTick = 0;
+    barTick = (barTick + 6) % 200;
+    tft.fillRect(40, 130, 240, 16, tft.color565(30, 30, 60));
+    tft.fillRect(40 + barTick, 130, 60, 16, TFT_CYAN);
+    char kbuf[24];
+    snprintf(kbuf, sizeof(kbuf), "%u KB", (unsigned)(upload.totalSize / 1024));
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.fillRect(120, 152, 80, 10, TFT_BLACK);
+    tft.drawString(kbuf, 160, 155);
 
   } else if (upload.status == UPLOAD_FILE_END) {
     if (Update.end(true)) {
@@ -1309,6 +1307,8 @@ void setupWiFi() {
     tft.drawString("Avvio tra 3s...", 160, 138);
     Serial.printf("[WiFi] Connesso! IP: %s\n", deviceIP.c_str());
     delay(3000);
+    tft.fillScreen(TFT_BLACK);
+
   } else {
     // WiFi failed — continue without OTA
     Serial.println("[WiFi] Timeout connessione — OTA non disponibile");
@@ -1320,6 +1320,8 @@ void setupWiFi() {
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.drawString("Avvio offline...", 160, 128);
     delay(2000);
+    tft.fillScreen(TFT_BLACK);
+
   }
 }
 

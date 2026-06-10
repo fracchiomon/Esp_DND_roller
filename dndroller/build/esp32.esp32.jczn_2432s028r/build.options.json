@@ -1,0 +1,10 @@
+{
+  "additionalFiles": "..\\..,..\\..",
+  "builtInLibrariesFolders": "C:\\Users\\poeri\\AppData\\Local\\Arduino15\\libraries",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "",
+  "fqbn": "esp32:esp32:jczn_2432s028r:UploadSpeed=921600,CPUFreq=240,FlashFreq=80,FlashMode=qio,FlashSize=4M,PartitionScheme=default,DebugLevel=none,LoopCore=1,EventsCore=1,EraseFlash=none,JTAGAdapter=default,ZigbeeMode=default",
+  "hardwareFolders": "C:\\Users\\poeri\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.10,C:\\Users\\poeri\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.10",
+  "otherLibrariesFolders": "C:\\Users\\poeri\\Documents\\Arduino\\libraries",
+  "sketchLocation": "C:\\Users\\poeri\\Documents\\GitHub\\Esp_DND_roller\\dndroller"
+}
