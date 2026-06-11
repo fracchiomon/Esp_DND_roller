@@ -15,8 +15,26 @@ using namespace fs;
 #include <Update.h>
 #include <secrets.h>
 
+
+// ── Web Serial Monitor ────────────────────────────────────────────────────────
+#define LOG_BUFFER_SIZE 4096
+extern char     logBuffer[];
+extern uint16_t logHead;
+extern uint16_t logLen;
+void webLog(const char* msg);  // forward declaration
+
+#define WLOG(fmt, ...) do { \
+  char _wbuf[256]; \
+  snprintf(_wbuf, sizeof(_wbuf), fmt, ##__VA_ARGS__); \
+  Serial.print(_wbuf); \
+  webLog(_wbuf); \
+} while(0)
+
+// Actual buffer + webLog definition (placed before OTA handlers)
+
 // ── OTA Web Updater ───────────────────────────────────────────────────────────
 // Change credentials before first flash; after that update via http://<ip>/update
+
 #define OTA_PORT    80
 
 WebServer otaServer(OTA_PORT);
@@ -136,8 +154,7 @@ int rollDie(int sides) {
         if (DEBUG_MODE)
           Serial.printf("[KARMA] AUTO SUCCESS roll=%d  dc=%d  p=%.3f  debt=%.4f\n",
                         roll, dc, p, karmicDebt);
-        // Plotter
-        if (DEBUG_MODE) Serial.printf("Roll:%d\tDebt:%.3f\n", roll, karmicDebt);
+
         return roll;
       }
     }
@@ -159,12 +176,12 @@ int rollDie(int sides) {
     roll = rollUnbiasedDie(sides);
   }
 
-  // Serial Plotter
+  // Log roll result to web monitor
   if (DEBUG_MODE) {
     if (useKarmicDice)
-      Serial.printf("Roll:%d\tDebt:%.3f\n", roll, karmicDebt);
+      WLOG("[ROLL] %d  debt=%.3f\n", roll, karmicDebt);
     else
-      Serial.printf("Roll:%d\n", roll);
+      WLOG("[ROLL] %d\n", roll);
   }
 
   return roll;
@@ -439,7 +456,7 @@ bool isRolling = false;  // Track if we're in rolling animation
 unsigned long lastAnimationTime = 0;
 unsigned long animationStartTime  = 0;
 unsigned long lastActivityTime    = 0;
-const unsigned long SLEEP_TIMEOUT = 5UL * 60UL * 1000UL;
+const unsigned long SLEEP_TIMEOUT = 3UL * 60UL * 1000UL;
 
 // Global orthographic scale so all dice share the same on-screen size
 const float ORTHO_SCALE = 40.0f;  // tuned to roughly match D20 apparent size
@@ -1142,57 +1159,169 @@ void setupDiceButtons() {
 
 
 // ── OTA page (served at http://<ip>/) ────────────────────────────────────────
+// ── Web log buffer (definition) ──────────────────────────────────────────────
+char     logBuffer[LOG_BUFFER_SIZE];
+uint16_t logHead = 0;
+uint16_t logLen  = 0;
+
+void webLog(const char* msg) {
+  size_t msgLen = strlen(msg);
+  for (size_t i = 0; i < msgLen; i++) {
+    logBuffer[logHead] = msg[i];
+    logHead = (logHead + 1) % LOG_BUFFER_SIZE;
+    if (logLen < LOG_BUFFER_SIZE) logLen++;
+  }
+}
+
 static const char OTA_HTML[] PROGMEM = R"rawhtml(
 <!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DnD Roller OTA</title>
+<title>DnD Roller</title>
 <style>
-  body{font-family:sans-serif;background:#1a1a2e;color:#eee;text-align:center;padding:40px}
-  h1{color:#e94560}
-  .card{background:#16213e;border-radius:12px;padding:30px;max-width:480px;margin:0 auto}
-  input[type=file]{margin:16px 0;color:#aaa}
-  .btn{background:#e94560;color:#fff;border:none;padding:12px 32px;border-radius:6px;
-       cursor:pointer;font-size:16px;margin-top:16px}
-  .btn:hover{background:#c73652}
-  progress{width:90%;height:22px;margin:16px auto;display:none;border-radius:4px}
-  #status{margin-top:12px;font-size:14px;color:#aaa;min-height:20px}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:sans-serif;background:#1a1a2e;color:#eee;min-height:100vh}
+h1{color:#e94560;margin-bottom:4px}
+.sub{color:#888;font-size:13px;margin-bottom:20px}
+.wrap{display:flex;gap:16px;padding:20px;max-width:960px;margin:0 auto;flex-wrap:wrap}
+.card{background:#16213e;border-radius:12px;padding:20px;flex:1;min-width:280px}
+.card h2{color:#0f9;font-size:15px;margin-bottom:12px;letter-spacing:.5px}
+/* OTA */
+.drop{border:2px dashed #444;border-radius:8px;padding:32px 16px;text-align:center;
+      cursor:pointer;transition:.2s;color:#888;font-size:14px}
+.drop.over{border-color:#e94560;color:#e94560;background:#1f1030}
+.drop.ready{border-color:#0f9;color:#0f9}
+.drop input{display:none}
+.btn{background:#e94560;color:#fff;border:none;padding:10px 24px;border-radius:6px;
+     cursor:pointer;font-size:14px;margin-top:12px;width:100%}
+.btn:disabled{background:#444;cursor:default}
+.btn.green{background:#0a7a50}
+progress{width:100%;height:14px;margin-top:10px;display:none;border-radius:4px}
+#fstatus{margin-top:8px;font-size:13px;color:#aaa;min-height:16px}
+/* Serial */
+#log{background:#0d1117;border-radius:6px;padding:10px;height:320px;overflow-y:auto;
+     font-family:monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;color:#7ec8e3}
+.logbar{display:flex;gap:8px;margin-top:8px}
+.logbar input{flex:1;background:#0d1117;border:1px solid #333;border-radius:4px;
+              color:#eee;padding:6px 10px;font-family:monospace;font-size:13px}
+.logbar button{background:#333;color:#eee;border:none;border-radius:4px;
+               padding:6px 14px;cursor:pointer;font-size:13px}
+.logbar button:hover{background:#555}
+#polling{font-size:11px;color:#555;margin-top:4px}
+header{padding:20px 20px 0;max-width:960px;margin:0 auto}
 </style></head><body>
+<header><h1>&#127922; DnD Roller</h1><p class="sub">OTA Update &amp; Serial Monitor</p></header>
+<div class="wrap">
+
+<!-- OTA card -->
 <div class="card">
-  <h1>&#127922; DnD Roller OTA</h1>
-  <p>Seleziona il <b>.bin</b> esportato da Arduino IDE<br>
-  <small>(Sketch → Esporta binario compilato)</small></p>
-  <input type="file" id="file" accept=".bin">
-  <br>
-  <button class="btn" onclick="upload()">Flasha firmware</button>
-  <br>
+  <h2>&#128229; FLASH FIRMWARE</h2>
+  <div class="drop" id="drop" onclick="document.getElementById('file').click()">
+    <div id="dropLabel">Trascina il <b>.bin</b> qui<br><small>oppure clicca per selezionare</small></div>
+    <input type="file" id="file" accept=".bin" onchange="fileChosen(this.files[0])">
+  </div>
+  <button class="btn" id="flashBtn" onclick="upload()" disabled>Seleziona un file</button>
   <progress id="prog" max="100" value="0"></progress>
-  <div id="status"></div>
+  <div id="fstatus"></div>
 </div>
+
+<!-- Serial Monitor card -->
+<div class="card">
+  <h2>&#128187; SERIAL MONITOR</h2>
+  <div id="log"></div>
+  <div class="logbar">
+    <input id="cmd" placeholder="Inserisci comando..." onkeydown="if(event.key==='Enter')sendCmd()">
+    <button onclick="sendCmd()">Invia</button>
+    <button onclick="clearLog()">Clear</button>
+  </div>
+  <div id="polling">&#9679; polling...</div>
+</div>
+</div>
+
 <script>
+// ── Drag & drop ──
+var chosenFile=null;
+var drop=document.getElementById('drop');
+drop.addEventListener('dragover',function(e){e.preventDefault();drop.classList.add('over');});
+drop.addEventListener('dragleave',function(){drop.classList.remove('over');});
+drop.addEventListener('drop',function(e){
+  e.preventDefault();drop.classList.remove('over');
+  fileChosen(e.dataTransfer.files[0]);
+});
+function fileChosen(f){
+  if(!f||!f.name.endsWith('.bin')){
+    document.getElementById('dropLabel').innerHTML='&#10060; Solo file .bin';
+    drop.classList.remove('ready');return;
+  }
+  chosenFile=f;
+  drop.classList.add('ready');
+  document.getElementById('dropLabel').innerHTML='&#9989; <b>'+f.name+'</b><br><small>'+Math.round(f.size/1024)+' KB</small>';
+  var btn=document.getElementById('flashBtn');
+  btn.textContent='Flasha '+f.name;btn.disabled=false;
+}
+
+// ── Upload ──
 function upload(){
-  var f=document.getElementById('file').files[0];
-  if(!f){alert('Seleziona un file .bin');return;}
-  var fd=new FormData();fd.append('firmware',f);
+  if(!chosenFile)return;
+  var fd=new FormData();fd.append('firmware',chosenFile);
   var xhr=new XMLHttpRequest();
+  var btn=document.getElementById('flashBtn');
+  btn.disabled=true;
   xhr.upload.onprogress=function(e){
     var p=Math.round(e.loaded/e.total*100);
     document.getElementById('prog').style.display='block';
     document.getElementById('prog').value=p;
-    document.getElementById('status').textContent='Caricamento: '+p+'%';
+    document.getElementById('fstatus').textContent='Caricamento: '+p+'%';
   };
   xhr.onload=function(){
     if(xhr.status===200){
-      document.getElementById('status').textContent='✓ Completato! Il dispositivo si riavvierà...';
+      document.getElementById('fstatus').textContent='✓ Completato! Riavvio in corso...';
       document.getElementById('prog').value=100;
+      btn.textContent='Completato';btn.classList.add('green');
     } else {
-      document.getElementById('status').textContent='✗ Errore: '+xhr.responseText;
+      document.getElementById('fstatus').textContent='✗ Errore: '+xhr.responseText;
+      btn.disabled=false;
     }
   };
   xhr.onerror=function(){
-    document.getElementById('status').textContent='✗ Connessione persa';
+    document.getElementById('fstatus').textContent='✗ Connessione persa';
+    btn.disabled=false;
   };
   xhr.open('POST','/update');xhr.send(fd);
 }
+
+// ── Serial Monitor (HTTP polling) ──
+var lastOffset=0,polling=true,autoScroll=true;
+function pollLog(){
+  if(!polling)return;
+  var xhr=new XMLHttpRequest();
+  xhr.open('GET','/log?offset='+lastOffset);
+  xhr.onload=function(){
+    if(xhr.status===200&&xhr.responseText.length>0){
+      var log=document.getElementById('log');
+      log.textContent+=xhr.responseText;
+      lastOffset+=xhr.responseText.length;
+      if(autoScroll)log.scrollTop=log.scrollHeight;
+    }
+    document.getElementById('polling').textContent='\u25cf connesso  offset:'+lastOffset;
+  };
+  xhr.onerror=function(){
+    document.getElementById('polling').textContent='\u25cb disconnesso';
+  };
+  xhr.send();
+  setTimeout(pollLog,500);
+}
+function sendCmd(){
+  var inp=document.getElementById('cmd');
+  var cmd=inp.value.trim();if(!cmd)return;
+  inp.value='';
+  fetch('/cmd',{method:'POST',body:cmd,headers:{'Content-Type':'text/plain'}});
+}
+function clearLog(){
+  document.getElementById('log').textContent='';
+  lastOffset=0;
+  fetch('/logclear');
+}
+pollLog();
 </script></body></html>
 )rawhtml";
 
@@ -1214,7 +1343,7 @@ void otaHandleUpload() {
     tft.setTextSize(1);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.drawString(upload.filename.c_str(), 160, 115);
-    Serial.printf("[OTA] Avvio: %s\n", upload.filename.c_str());
+    WLOG("[OTA] Avvio: %s\n", upload.filename.c_str());
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
       Update.printError(Serial);
     }
@@ -1239,7 +1368,7 @@ void otaHandleUpload() {
 
   } else if (upload.status == UPLOAD_FILE_END) {
     if (Update.end(true)) {
-      Serial.printf("[OTA] Completato: %u byte\n", upload.totalSize);
+      WLOG("[OTA] Completato: %u byte\n", (unsigned)upload.totalSize);
       tft.fillRect(40, 130, 240, 16, TFT_GREEN);
       tft.setTextDatum(MC_DATUM);
       tft.setTextColor(TFT_GREEN, TFT_BLACK);
@@ -1265,11 +1394,55 @@ void otaHandleUpdateEnd() {
   }
 }
 
+void otaHandleLog() {
+  // Return new log bytes since 'offset' query param
+  String offsetStr = otaServer.arg("offset");
+  int offset = offsetStr.length() > 0 ? offsetStr.toInt() : 0;
+  if (offset < 0) offset = 0;
+
+  // Build response string from circular buffer
+  // logLen = total bytes ever written, logHead = next write pos
+  String out = "";
+  if (logLen > 0) {
+    // Reconstruct ordered buffer content
+    char ordered[LOG_BUFFER_SIZE + 1];
+    int total = logLen < LOG_BUFFER_SIZE ? logLen : LOG_BUFFER_SIZE;
+    int start = (logLen < LOG_BUFFER_SIZE) ? 0 : logHead;
+    for (int i = 0; i < total; i++)
+      ordered[i] = logBuffer[(start + i) % LOG_BUFFER_SIZE];
+    ordered[total] = ' ';
+
+    if (offset < total)
+      out = String(ordered + offset);
+  }
+  otaServer.sendHeader("Access-Control-Allow-Origin", "*");
+  otaServer.send(200, "text/plain", out);
+}
+
+void otaHandleCmd() {
+  if (otaServer.method() == HTTP_POST && otaServer.hasArg("plain")) {
+    String cmd = otaServer.arg("plain");
+    cmd.trim();
+    WLOG("[WEB] > %s\n", cmd.c_str());
+    handleSerialCommand(cmd);  // reuse existing serial command handler
+  }
+  otaServer.send(200, "text/plain", "OK");
+}
+
+void otaHandleLogClear() {
+  logHead = 0; logLen = 0;
+  memset(logBuffer, 0, LOG_BUFFER_SIZE);
+  otaServer.send(200, "text/plain", "OK");
+}
+
 void setupOTA() {
-  otaServer.on("/",       HTTP_GET,  otaHandleRoot);
-  otaServer.on("/update", HTTP_POST, otaHandleUpdateEnd, otaHandleUpload);
+  otaServer.on("/",         HTTP_GET,  otaHandleRoot);
+  otaServer.on("/update",   HTTP_POST, otaHandleUpdateEnd, otaHandleUpload);
+  otaServer.on("/log",      HTTP_GET,  otaHandleLog);
+  otaServer.on("/cmd",      HTTP_POST, otaHandleCmd);
+  otaServer.on("/logclear", HTTP_GET,  otaHandleLogClear);
   otaServer.begin();
-  Serial.printf("[OTA] Server avviato su http://%s/\n", deviceIP.c_str());
+  WLOG("[OTA] Server avviato su http://%s/\n", deviceIP.c_str());
 }
 
 // WiFi + OTA init — called from setup()
@@ -1306,13 +1479,12 @@ void setupWiFi() {
     tft.drawString("OTA: http://" + deviceIP + "/", 160, 118);
     tft.setTextColor(TFT_YELLOW, TFT_BLACK);
     tft.drawString("Avvio tra 3s...", 160, 138);
-    Serial.printf("[WiFi] Connesso! IP: %s\n", deviceIP.c_str());
+    WLOG("[WiFi] Connesso! IP: %s\n", deviceIP.c_str());
     delay(3000);
-    tft.fillScreen(TFT_BLACK);
-
+	  tft.fillScreen(TFT_BLACK);
   } else {
     // WiFi failed — continue without OTA
-    Serial.println("[WiFi] Timeout connessione — OTA non disponibile");
+    WLOG("[WiFi] Timeout connessione - OTA non disponibile\n");
     tft.fillScreen(TFT_BLACK);
     tft.setTextDatum(MC_DATUM);
     tft.setTextSize(1);
@@ -1320,9 +1492,8 @@ void setupWiFi() {
     tft.drawString("WiFi non disponibile", 160, 110);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.drawString("Avvio offline...", 160, 128);
-    delay(2000);
-    tft.fillScreen(TFT_BLACK);
-
+    delay(1000);
+	  tft.fillScreen(TFT_BLACK);
   }
 }
 
@@ -1370,7 +1541,6 @@ void setup() {
   // esp_random() used for dice — randomSeed() not needed
   if (DEBUG_MODE) {
     Serial.println("=== DnD Roller DEBUG MODE ===");
-    Serial.println("Serial Plotter: Roll / KarmaAvg");
   }
   tft.begin();
   tft.setRotation(1);  // Landscape 90° right
